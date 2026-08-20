@@ -11,18 +11,34 @@
   let deleting = $state(false)
   let error = $state(null)
 
-  // Publish date and snippet are optional at creation time, so both are
-  // editable here. Everything else about an article is fixed.
+  // Publish date, revision stamp and snippet are optional at creation time, so
+  // all three are editable here. Everything else about an article is fixed.
   let publishedAt = $state(untrack(() => article.published_at ?? null))
+  let updatedAt = $state(untrack(() => article.updated_at ?? null))
   let snippet = $state(untrack(() => article.snippet ?? ''))
 
   let editingDate = $state(false)
+  // Named for the date field, not the "Add update" run flow below.
+  let editingUpdatedDate = $state(false)
   let editingSnippet = $state(false)
   let draftDate = $state('')
+  let draftUpdatedDate = $state('')
   let draftSnippet = $state('')
   let savingField = $state(false)
 
+  // Read-only here: the snapshot arrives with the scraper payload, and hand
+  // editing it would defeat the point of it being a snapshot.
+  const markdown = $derived(article.markdown ?? '')
+  const captured = $derived(
+    article.markdown_at ? formatDateTime(article.markdown_at) : null
+  )
+
   const published = $derived(publishedAt ? formatDateTime(publishedAt) : null)
+  const updated = $derived(updatedAt ? formatDateTime(updatedAt) : null)
+  // A revision that predates publication is a typo somewhere, worth showing.
+  const updatedBackwards = $derived(
+    publishedAt && updatedAt ? new Date(updatedAt) < new Date(publishedAt) : false
+  )
 
   async function patchArticle(body) {
     savingField = true
@@ -51,6 +67,14 @@
     if (await patchArticle({ published_at: iso })) {
       publishedAt = iso
       editingDate = false
+    }
+  }
+
+  async function saveUpdatedDate() {
+    const iso = draftUpdatedDate ? new Date(draftUpdatedDate).toISOString() : null
+    if (await patchArticle({ updated_at: iso })) {
+      updatedAt = iso
+      editingUpdatedDate = false
     }
   }
 
@@ -159,6 +183,14 @@
           <input type="datetime-local" bind:value={draftDate} />
           <button class="mini primary" onclick={saveDate} disabled={savingField}>Save</button>
           <button class="mini" onclick={() => (editingDate = false)}>Cancel</button>
+          {#if publishedAt}
+            <button
+              class="mini"
+              onclick={() => { draftDate = ''; saveDate() }}
+              disabled={savingField}
+              title="Remove the publish date — better than a guessed one"
+            >Clear</button>
+          {/if}
         </p>
       {:else}
         <p class="date">
@@ -168,6 +200,34 @@
             onclick={() => { draftDate = toLocalInputValue(publishedAt); editingDate = true }}
           >{published ? `Published ${published}` : 'add publish date'}</button>
           &middot; {questionCount} question(s)
+        </p>
+      {/if}
+
+      {#if editingUpdatedDate}
+        <p class="date editor">
+          <input type="datetime-local" bind:value={draftUpdatedDate} />
+          <button class="mini primary" onclick={saveUpdatedDate} disabled={savingField}>Save</button>
+          <button class="mini" onclick={() => (editingUpdatedDate = false)}>Cancel</button>
+          {#if updatedAt}
+            <button
+              class="mini"
+              onclick={() => { draftUpdatedDate = ''; saveUpdatedDate() }}
+              disabled={savingField}
+            >Clear</button>
+          {/if}
+        </p>
+      {:else}
+        <p class="date">
+          <button
+            class="field"
+            class:empty={!updated}
+            class:warn={updatedBackwards}
+            title={updatedBackwards ? 'This revision predates publication — check the dates' : null}
+            onclick={() => {
+              draftUpdatedDate = toLocalInputValue(updatedAt)
+              editingUpdatedDate = true
+            }}
+          >{updated ? `Updated ${updated}` : 'add updated date'}</button>
         </p>
       {/if}
 
@@ -188,6 +248,16 @@
             onclick={() => { draftSnippet = snippet; editingSnippet = true }}
           >{snippet || 'add snippet'}</button>
         </p>
+      {/if}
+
+      {#if markdown}
+        <details class="md">
+          <summary>
+            article markdown
+            {#if captured}<span class="captured">captured {captured}</span>{/if}
+          </summary>
+          <pre>{markdown}</pre>
+        </details>
       {/if}
     </div>
 
@@ -329,6 +399,7 @@
   .field { padding: 0; font: inherit; color: inherit; background: none; border: 0; cursor: pointer; text-align: left; }
   .field:hover { text-decoration: underline; }
   .field.empty { font-style: italic; color: #8490a8; }
+  .field.warn { color: var(--danger); }
 
   .editor { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 0.3rem; }
   .editor input, .editor textarea { padding: 0.2rem 0.35rem; font: inherit; font-size: 0.78rem; border: 1px solid #dfe4ec; }
@@ -340,5 +411,23 @@
   .mini:disabled { opacity: 0.45; cursor: default; }
 
   .snippet-label { margin-right: 0.4rem; font-size: 0.72rem; font-style: italic; color: #8490a8; }
+
+  /* Reference material, not something to scroll past on every card, so it
+     stays folded until asked for. */
+  .md { margin-top: 0.55rem; max-width: 90ch; }
+  .md summary { font-size: 0.72rem; font-style: italic; color: #8490a8; cursor: pointer; }
+  .md summary:hover { color: var(--text); }
+  .md .captured { margin-left: 0.4rem; font-style: normal; }
+  .md pre {
+    margin: 0.5rem 0 0;
+    padding: 0.6rem 0.7rem;
+    max-height: 22rem;
+    overflow: auto;
+    white-space: pre-wrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.73rem;
+    line-height: 1.6;
+    border: 1px solid #dfe4ec;
+  }
   .error { margin-top: 0.8rem; color: var(--danger); font-size: 0.85rem; }
 </style>

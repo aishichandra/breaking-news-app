@@ -3,7 +3,7 @@
   import { API } from './api.js'
   import CitationRow from './CitationRow.svelte'
   import { highlightSegments } from './highlight.js'
-  import { describeLag, formatDateTime } from './time.js'
+  import { describeLag } from './time.js'
   import { PLATFORM_LABELS as LABELS, VERDICTS } from './verdicts.js'
 
   let {
@@ -99,12 +99,9 @@
   {#if result}
     {#if saveError}<p class="save-error">{saveError}</p>{/if}
 
-    {#if askedAt}
+    {#if lag}
       <p class="when">
-        <time datetime={askedAt}>{formatDateTime(askedAt)}</time>
-        {#if lag}
-          <span class="lag" class:warn={lag.negative}>{lag.text}</span>
-        {/if}
+        <span class="lag" class:warn={lag.negative}>{lag.text}</span>
       </p>
     {/if}
 
@@ -123,11 +120,15 @@
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>Citation</th><th>Published</th></tr>
+              <tr><th>Citation</th><th>Published</th><th class="vs">v article</th></tr>
             </thead>
             <tbody>
               {#each citations as c, i (`${c.url ?? ''}#${i}`)}
-                <CitationRow citation={c} onSaved={onCitationSaved} />
+                <CitationRow
+                  citation={c}
+                  articlePublishedAt={publishedAt}
+                  onSaved={onCitationSaved}
+                />
               {/each}
             </tbody>
           </table>
@@ -216,10 +217,6 @@
     font-variant-numeric: tabular-nums;
   }
 
-  .when time {
-    color: var(--text);
-    font-weight: 550;
-  }
 
   .grade { display: flex; align-items: center; gap: 0.2rem; margin-top: 0.75rem; padding-top: 0.7rem; border-top: 1px solid var(--line); }
   .verdict-name { margin-left: 0.35rem; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
@@ -322,7 +319,9 @@
     white-space: nowrap;
     border-bottom: 1px solid var(--line);
   }
-  th:last-child { text-align: right; }
+  /* Citation stays left; the two numeric columns line up on the right. */
+  th + th { text-align: right; }
+  th:last-child { padding-right: 0; }
 
   /* Instant tooltip. The native `title` attribute waits about a second before
      showing, which is useless for a row of symbol buttons you're scanning. */

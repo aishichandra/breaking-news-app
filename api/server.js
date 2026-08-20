@@ -7,11 +7,67 @@ import { MongoClient, ObjectId } from 'mongodb'
 import { buildQuestions } from './normalize.js'
 import { milestoneForRun, runAskedAt } from './reask-schedule.js'
 
-const client = new MongoClient(process.env.MONGODB_URI)
-await client.connect()
-console.log('Connected to MongoDB')
+const MONGODB_URI = process.env.MONGODB_URI
 
+// Name the problem in one line. Handing undefined to MongoClient throws deep
+// inside the driver's URL parser instead, which reads like a library bug and
+// buries the fact that a variable simply was never set.
+if (!MONGODB_URI) {
+  console.error(
+    'MONGODB_URI is not set. Add it to api/.env for local runs, or to the service variables on your host.'
+  )
+  process.exit(1)
+}
+
+const client = new MongoClient(MONGODB_URI)
 const db = client.db('breaking_news')
+
+// A cluster can be briefly unreachable during a failover or a redeploy.
+// Exiting on the first refusal spends one of the host's restart attempts, and
+// hosts stop retrying after a handful — so a blip lasting seconds becomes a
+// service that stays down until someone redeploys by hand.
+async function connectWithRetry(attempts = 5) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await client.connect()
+      console.log('Connected to MongoDB')
+      return
+    } catch (err) {
+      if (attempt === attempts) throw err
+      const wait = Math.min(1000 * 2 ** (attempt - 1), 15000)
+      console.warn(
+        `MongoDB connection failed (${attempt}/${attempts}): ${err.message} — retrying in ${wait}ms`
+      )
+      await new Promise((resolve) => setTimeout(resolve, wait))
+    }
+  }
+}
+
+// createIndex is idempotent, so declaring these on boot costs nothing on a warm
+// database and means a fresh one is shaped correctly without anyone remembering
+// to run migrate-runs.js. Failures are logged, not fatal: missing indexes make
+// reads slow, whereas refusing to start makes them impossible.
+async function ensureIndexes() {
+  const wanted = [
+    ['articles', { url_key: 1 }, { unique: true }],
+    ['answers', { question_id: 1, run_at: -1 }, {}],
+    ['answers', { article_id: 1, question_id: 1, platform: 1, run_at: -1 }, {}],
+    ['sources', { url: 1, method: 1 }, {}]
+  ]
+
+  for (const [collection, key, options] of wanted) {
+    try {
+      await db.collection(collection).createIndex(key, options)
+    } catch (err) {
+      console.warn(
+        `Index on ${collection} ${JSON.stringify(key)} not applied: ${err.message}`
+      )
+    }
+  }
+}
+
+await connectWithRetry()
+await ensureIndexes()
 
 // Platforms append their own tracking parameters, so the same article arrives
 // as several distinct URLs (?utm_source=chatgpt.com, ?ampMode=1). Keying on a
@@ -55,62 +111,12 @@ function forEachCitation(articles, fn) {
 }
 
 // Answers live in their own collection, one document per question x platform x
-// run. The UI still wants them shaped as `question.platforms.<name>`, so the
-// join happens here and the components stay unchanged.
-async function attachLatestRun(articles) {
-  const questionIds = []
-  for (const article of articles) {
-    for (const question of article.questions ?? []) {
-      if (question.question_id) questionIds.push(question.question_id)
-    }
-  }
-  if (questionIds.length === 0) return articles
-
-  const latest = await db
-    .collection('answers')
-    .aggregate([
-      { $match: { question_id: { $in: questionIds } } },
-      { $sort: { run_at: -1 } },
-      {
-        $group: {
-          _id: { question_id: '$question_id', platform: '$platform' },
-          doc: { $first: '$$ROOT' },
-          run_count: { $sum: 1 }
-        }
-      },
-      { $replaceRoot: { newRoot: { $mergeObjects: ['$doc', { run_count: '$run_count' }] } } }
-    ])
-    .toArray()
-
-  const byQuestion = new Map()
-  for (const doc of latest) {
-    const key = String(doc.question_id)
-    if (!byQuestion.has(key)) byQuestion.set(key, {})
-    byQuestion.get(key)[doc.platform] = doc
-  }
-
-  for (const article of articles) {
-    for (const question of article.questions ?? []) {
-      const platforms = byQuestion.get(String(question.question_id))
-      if (!platforms) continue
-
-      question.platforms = platforms
-      question.run_count = Math.max(...Object.values(platforms).map((p) => p.run_count ?? 1))
-      // Explicit comparator: bare .sort() compares Dates as strings, which
-      // orders "Wed Aug 20" before "Wed Aug 19".
-      const runTimes = Object.values(platforms)
-        .map((p) => p.run_at)
-        .filter(Boolean)
-        .sort((a, b) => new Date(a) - new Date(b))
-      question.latest_run_at = runTimes.at(-1) ?? null
-    }
-  }
-
-  return articles
-}
-
-// Every collection run for each question, oldest first — powers the timeline UI.
-async function attachRunHistory(articles) {
+// run. The UI wants two shapes out of that: the newest answer per platform as
+// `question.platforms.<name>`, and every run in order as `question.runs`. Both
+// come from the same documents, so this reads them once. Fetching twice — an
+// aggregation for the latest and a find for the history — pulled every answer
+// across the wire twice on every page load.
+async function attachAnswers(articles) {
   const questionIds = []
   for (const article of articles) {
     for (const question of article.questions ?? []) {
@@ -128,24 +134,49 @@ async function attachRunHistory(articles) {
   const byQuestion = new Map()
   for (const doc of docs) {
     const qKey = String(doc.question_id)
-    const rKey = String(doc.run_id)
-    if (!byQuestion.has(qKey)) byQuestion.set(qKey, new Map())
-    const runs = byQuestion.get(qKey)
-    if (!runs.has(rKey)) {
-      runs.set(rKey, { run_id: doc.run_id, run_at: doc.run_at, platforms: {} })
+    let entry = byQuestion.get(qKey)
+    if (!entry) {
+      entry = { runs: new Map(), latest: {}, counts: {} }
+      byQuestion.set(qKey, entry)
     }
-    runs.get(rKey).platforms[doc.platform] = doc
+
+    const rKey = String(doc.run_id)
+    if (!entry.runs.has(rKey)) {
+      entry.runs.set(rKey, { run_id: doc.run_id, run_at: doc.run_at, platforms: {} })
+    }
+    entry.runs.get(rKey).platforms[doc.platform] = doc
+
+    // Ascending sort means the last document seen for a platform is its newest.
+    entry.latest[doc.platform] = doc
+    entry.counts[doc.platform] = (entry.counts[doc.platform] ?? 0) + 1
   }
 
   for (const article of articles) {
     const publishedAt = article.published_at
     for (const question of article.questions ?? []) {
-      const runsMap = byQuestion.get(String(question.question_id))
-      if (!runsMap) {
+      const entry = byQuestion.get(String(question.question_id))
+      if (!entry) {
         question.runs = []
         continue
       }
-      question.runs = [...runsMap.values()]
+
+      const platforms = {}
+      for (const [platform, doc] of Object.entries(entry.latest)) {
+        platforms[platform] = { ...doc, run_count: entry.counts[platform] }
+      }
+
+      question.platforms = platforms
+      question.run_count = Math.max(...Object.values(entry.counts))
+
+      // Explicit comparator: bare .sort() compares Dates as strings, which
+      // orders "Wed Aug 20" before "Wed Aug 19".
+      const runTimes = Object.values(platforms)
+        .map((p) => p.run_at)
+        .filter(Boolean)
+        .sort((a, b) => new Date(a) - new Date(b))
+      question.latest_run_at = runTimes.at(-1) ?? null
+
+      question.runs = [...entry.runs.values()]
         .sort((a, b) => new Date(runAskedAt(a)) - new Date(runAskedAt(b)))
         .map((run) => ({
           ...run,
@@ -185,6 +216,12 @@ const app = express()
 app.use(cors())
 app.use(express.json({ limit: '5mb' }))
 
+// Registered above the auth gate so uptime checks keep working once a password
+// is set — a monitor that receives 401 cannot distinguish "locked" from "down".
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true })
+})
+
 // Optional HTTP Basic Auth. Off when AUTH_PASSWORD is unset, so local dev is
 // unchanged; set it in Railway and the whole app (UI and API) requires it.
 const AUTH_USER = process.env.AUTH_USER || 'admin'
@@ -215,14 +252,24 @@ if (AUTH_PASSWORD) {
   console.log('AUTH_PASSWORD not set — running without authentication')
 }
 
-app.get('/api/health', (req, res) => {
-  res.json({ ok: true })
-})
-
+// Newest addition first. Ordering on when a row was *added* rather than when
+// the story was published keeps whatever you just entered at the top of the
+// page, which is where you go looking for it.
 app.get('/api/articles', async (req, res) => {
   try {
-    const articles = await db.collection('articles').find().toArray()
-    res.json(await attachSourceDates(await attachRunHistory(await attachLatestRun(articles))))
+    const articles = await db
+      .collection('articles')
+      .aggregate([
+        // Rows written before created_at existed fall back to the timestamp
+        // baked into their ObjectId, so they sort sensibly instead of sinking
+        // to the bottom as nulls.
+        { $addFields: { added_at: { $ifNull: ['$created_at', { $toDate: '$_id' }] } } },
+        { $sort: { added_at: -1 } },
+        { $unset: 'added_at' }
+      ])
+      .toArray()
+
+    res.json(await attachSourceDates(await attachAnswers(articles)))
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Failed to fetch articles' })
@@ -238,7 +285,8 @@ function questionKey(text) {
 
 app.post('/api/articles', async (req, res) => {
   try {
-    const { url, published_at, snippet, questions, platform_answers } = req.body
+    const { url, published_at, updated_at, snippet, markdown, questions, platform_answers } =
+      req.body
 
     if (!url) {
       return res.status(400).json({ error: 'url is required' })
@@ -256,7 +304,16 @@ app.post('/api/articles', async (req, res) => {
         url,
         url_key: urlKey,
         published_at: published_at ? new Date(published_at) : null,
+        // The story's own "Updated on…" stamp, separate from created_at, which
+        // is when this row was written. Breaking news gets rewritten in place,
+        // so the two dates answer different questions.
+        updated_at: updated_at ? new Date(updated_at) : null,
         snippet: typeof snippet === 'string' && snippet.trim() ? snippet.trim() : null,
+        // The article's full text as it read when this run was collected. News
+        // pages get rewritten under their own URLs, so the snapshot is the only
+        // record of what the platforms could actually have been reading.
+        markdown: typeof markdown === 'string' && markdown.trim() ? markdown.trim() : null,
+        markdown_at: typeof markdown === 'string' && markdown.trim() ? new Date() : null,
         questions: built.map((q) => ({
           question_id: new ObjectId(),
           question_index: q.question_index,
@@ -295,6 +352,21 @@ app.post('/api/articles', async (req, res) => {
       // Fill in details the first submission may have lacked, never overwrite.
       if (published_at && !article.published_at) $set.published_at = new Date(published_at)
       if (snippet?.trim() && !article.snippet) $set.snippet = snippet.trim()
+      if (markdown?.trim() && !article.markdown) {
+        $set.markdown = markdown.trim()
+        $set.markdown_at = new Date()
+      }
+
+      // The exception to never-overwrite: a revision stamp is *expected* to
+      // move. A later run reporting a newer edit is news, not a correction.
+      if (updated_at) {
+        const revised = new Date(updated_at)
+        if (!Number.isNaN(revised.getTime())) {
+          if (!article.updated_at || revised > new Date(article.updated_at)) {
+            $set.updated_at = revised
+          }
+        }
+      }
     }
 
     if (appended.length || Object.keys($set).length) {
@@ -456,7 +528,7 @@ app.post('/api/articles/:id/runs', async (req, res) => {
 
 // Article-level fields the form no longer demands up front — fill them in
 // later from the Answers view. Only keys present in the body are touched.
-// PATCH /api/articles/:id  { published_at, snippet }
+// PATCH /api/articles/:id  { published_at, updated_at, snippet, markdown }
 app.patch('/api/articles/:id', async (req, res) => {
   try {
     const { id } = req.params
@@ -479,9 +551,29 @@ app.patch('/api/articles/:id', async (req, res) => {
       }
     }
 
+    if ('updated_at' in body) {
+      if (body.updated_at) {
+        const when = new Date(body.updated_at)
+        if (Number.isNaN(when.getTime())) {
+          return res.status(400).json({ error: 'updated_at is not a valid date' })
+        }
+        $set.updated_at = when
+      } else {
+        $set.updated_at = null
+      }
+    }
+
     if ('snippet' in body) {
       const text = typeof body.snippet === 'string' ? body.snippet.trim() : ''
       $set.snippet = text || null
+    }
+
+    if ('markdown' in body) {
+      const text = typeof body.markdown === 'string' ? body.markdown.trim() : ''
+      $set.markdown = text || null
+      // Stamped on every write: an edited snapshot is a snapshot of a later
+      // moment, and which moment it captures is the point of the field.
+      $set.markdown_at = text ? new Date() : null
     }
 
     if (Object.keys($set).length === 0) {
@@ -592,13 +684,16 @@ app.patch('/api/articles/:id/questions/:index', async (req, res) => {
     const result = await db
       .collection('articles')
       .updateOne(
-        { _id: target._id },
+        // Match the question too. Filtering on _id alone reports success when
+        // the article exists but carries no question at that index — the
+        // arrayFilter quietly matches nothing and the caller is told it saved.
+        { _id: target._id, 'questions.question_index': target.questionIndex },
         { $set },
         { arrayFilters: [{ 'q.question_index': target.questionIndex }] }
       )
 
     if (result.matchedCount === 0) {
-      return res.status(404).json({ error: 'Article not found' })
+      return res.status(404).json({ error: 'Article or question not found' })
     }
 
     res.json({ ok: true, updated: Object.keys($set) })
@@ -609,10 +704,19 @@ app.patch('/api/articles/:id/questions/:index', async (req, res) => {
 })
 
 // Manual citation publish dates, keyed by URL so one date applies everywhere
-// that URL is cited. POST /api/sources  [{ url, published_at }]
+// that URL is cited. POST /api/sources  [{ url, published_at, precision }]
+// `precision` is 'date' when the source printed a day but no clock time, so the
+// UI knows not to show the placeholder hour it was stored with.
 app.post('/api/sources', async (req, res) => {
   try {
     const items = Array.isArray(req.body) ? req.body : [req.body]
+
+    const bad = items.find(
+      (s) => s?.precision != null && !['date', 'datetime'].includes(s.precision)
+    )
+    if (bad) {
+      return res.status(400).json({ error: "precision must be 'date' or 'datetime'" })
+    }
 
     const ops = items
       .filter((s) => s?.url)
@@ -623,7 +727,9 @@ app.post('/api/sources', async (req, res) => {
             $set: {
               url: canonicalUrl(s.url),
               published_at: s.published_at ? new Date(s.published_at) : null,
-              precision: 'datetime',
+              // No date, no precision to describe — clearing one leaves the
+              // record saying "we looked and don't know", not "midnight".
+              precision: s.published_at ? s.precision ?? 'datetime' : null,
               status: 'ok',
               method: 'manual',
               resolved_at: new Date()
@@ -742,7 +848,40 @@ app.use((req, res) => {
 })
 
 const port = process.env.PORT || 3000
-app.listen(port, () => {
+const server = app.listen(port, () => {
   console.log(`API listening on http://localhost:${port}`)
+})
+
+// Hosts send SIGTERM before replacing a container. Without this the process is
+// killed mid-request and the Mongo connection is severed rather than closed.
+let shuttingDown = false
+
+async function shutdown(signal) {
+  if (shuttingDown) return
+  shuttingDown = true
+  console.log(`${signal} received — closing server and database connection`)
+  server.close()
+  try {
+    await client.close()
+  } catch (err) {
+    console.error('Error closing MongoDB connection:', err.message)
+  }
+  process.exit(0)
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'))
+process.on('SIGINT', () => shutdown('SIGINT'))
+
+// A stray rejected promise should not take the process down: the driver
+// reconnects on its own, and staying up keeps the rest of the API serving. An
+// uncaught exception is different — state is no longer trustworthy, so log it
+// and let the host restart cleanly.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection:', reason)
+})
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err)
+  process.exit(1)
 })
 

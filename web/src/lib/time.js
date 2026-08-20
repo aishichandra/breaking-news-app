@@ -80,6 +80,28 @@ export function domainOf(url) {
   }
 }
 
+// Source-to-story gaps span minutes to years, and at the long end the exact
+// figure is noise: "348d 14h 4m older" is a number to decode, "1y older" is a
+// fact you can read. One rounded unit, with the precise value kept for a
+// tooltip.
+export function formatCoarseDuration(ms) {
+  const abs = Math.abs(ms)
+
+  const hours = abs / 3600000
+  if (hours < 23.5) return `${Math.max(1, Math.round(hours))}h`
+
+  const days = abs / 86400000
+  if (days < 30) return `${Math.round(days)}d`
+
+  // Anything from eleven months out reads as a year — nobody scanning this
+  // column cares whether background material was 11 or 12 months stale.
+  const months = days / 30.44
+  if (months < 11) return `${Math.round(months)}mo`
+
+  const years = days / 365.25
+  return years < 1.75 ? '1y' : `${Math.round(years)}y`
+}
+
 // Compares a cited source's publish time against the article being asked about.
 // "older" means the platform leaned on something that predates the story;
 // "newer" means it reached for coverage published after it.
@@ -92,12 +114,15 @@ export function describeSourceAge(articleAt, sourceAt) {
   const DAY = 86400000
 
   if (Math.abs(ms) < 3600000) {
-    return { ms, label: 'same hour', older: false, stale: false }
+    return { ms, label: 'same hour', exact: 'within the hour', older: false, stale: false }
   }
+
+  const side = ms > 0 ? 'older' : 'newer'
 
   return {
     ms,
-    label: ms > 0 ? `${formatDuration(ms)} older` : `${formatDuration(ms)} newer`,
+    label: `${formatCoarseDuration(ms)} ${side}`,
+    exact: `${formatDuration(ms)} ${side}`,
     older: ms > 0,
     // A source more than a month older than the story is background, not news.
     stale: ms > 30 * DAY
@@ -124,6 +149,29 @@ export function toLocalInputValue(value) {
     `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
     `T${pad(d.getHours())}:${pad(d.getMinutes())}`
   )
+}
+
+// The citation editor splits the stamp in two, because plenty of outlets print
+// a date and no clock time. These fill the halves; the time half comes back
+// empty for a date-only record so the field stays visibly unset.
+export function toLocalDateValue(value) {
+  return toLocalInputValue(value).slice(0, 10)
+}
+
+export function toLocalTimeValue(value, precision) {
+  if (precision === 'date') return ''
+  return toLocalInputValue(value).slice(11)
+}
+
+// Rebuilds a stored timestamp from those halves. A date with no time is pinned
+// to local noon — the same convention the CSV importer uses for dates dug out
+// of URLs — so the day renders correctly everywhere and an unknown time throws
+// the lag arithmetic off by at most half a day in either direction.
+export function fromLocalParts(date, time) {
+  if (!date) return null
+  const d = new Date(`${date}T${time || '12:00'}`)
+  if (Number.isNaN(d.getTime())) return null
+  return { iso: d.toISOString(), precision: time ? 'datetime' : 'date' }
 }
 
 // Full timestamp, degraded to a bare date when that's all the source gave us.

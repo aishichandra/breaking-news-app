@@ -1,9 +1,16 @@
 <script>
   import { untrack } from 'svelte'
   import { API } from './api.js'
-  import { domainOf, formatSourceStamp, toLocalInputValue } from './time.js'
+  import {
+    describeSourceAge,
+    domainOf,
+    formatSourceStamp,
+    fromLocalParts,
+    toLocalDateValue,
+    toLocalTimeValue
+  } from './time.js'
 
-  let { citation, onSaved = () => {} } = $props()
+  let { citation, articlePublishedAt = null, onSaved = () => {} } = $props()
 
   // A publish date belongs to the URL, not to this one citation, so saving
   // writes to the shared `sources` record.
@@ -11,47 +18,82 @@
   let precision = $state(untrack(() => citation.source_precision ?? null))
 
   let editing = $state(false)
-  let draft = $state('')
+  // Time is optional: many outlets stamp a story with a date and nothing more.
+  let draftDate = $state('')
+  let draftTime = $state('')
   let saving = $state(false)
   let error = $state(null)
 
+  // Depends on the incoming props ONLY. Reading `editing` as a dependency would
+  // re-run this the instant a save closes the editor — before the parent has
+  // refetched — overwriting the date just saved with the stale prop and making
+  // it flicker back for as long as the round trip takes.
   $effect(() => {
-    if (editing) return
-    publishedAt = citation.source_published_at ?? null
-    precision = citation.source_precision ?? null
+    const incoming = citation.source_published_at ?? null
+    const incomingPrecision = citation.source_precision ?? null
+
+    untrack(() => {
+      if (editing) return
+      publishedAt = incoming
+      precision = incomingPrecision
+    })
   })
 
   const domain = $derived(domainOf(citation.url) ?? 'source')
   const stamp = $derived(formatSourceStamp(publishedAt, precision))
 
+  // How far the cited source sits from the story being asked about.
+  const age = $derived(describeSourceAge(articlePublishedAt, publishedAt))
+  // A date-only source carries a placeholder hour, so the gap is approximate.
+  const ageLabel = $derived(
+    age ? (precision === 'date' ? `~${age.label}` : age.label) : null
+  )
+
+  // Enter saves, Escape backs out. Neither input sits in a form, so there is no
+  // implicit submission to lean on — and no navigation to preventDefault away.
+  function handleKey(event) {
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      if (!saving && draftDate) save()
+    } else if (event.key === 'Escape') {
+      event.preventDefault()
+      editing = false
+      error = null
+    }
+  }
+
+  // Clicking "set date" should land you in the field ready to type. Done as an
+  // action rather than the autofocus attribute, which trips the a11y warning.
+  function focusOnOpen(node) {
+    node.focus()
+  }
+
   function open() {
-    draft = toLocalInputValue(publishedAt)
+    draftDate = toLocalDateValue(publishedAt)
+    draftTime = toLocalTimeValue(publishedAt, precision)
     editing = true
     error = null
   }
 
-  async function save() {
+  // One writer for both saving and clearing: a null date is a legitimate value,
+  // not the absence of a save. Guessing a date you don't have is worse for the
+  // data than leaving the field empty, so taking one back has to be possible.
+  async function persist(iso, prec) {
     if (!citation.url) {
       error = 'This citation has no URL — cannot save a date'
-      return
-    }
-    if (!draft) return
-
-    const when = new Date(draft)
-    if (Number.isNaN(when.getTime())) {
-      error = 'That is not a valid date/time'
       return
     }
 
     saving = true
     error = null
-    const iso = when.toISOString()
 
     try {
       const res = await fetch(`${API}/api/sources`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify([{ url: citation.url, published_at: iso }])
+        body: JSON.stringify([
+          { url: citation.url, published_at: iso, precision: prec }
+        ])
       })
 
       if (!res.ok) {
@@ -60,7 +102,7 @@
       }
 
       publishedAt = iso
-      precision = 'datetime'
+      precision = prec
       editing = false
       onSaved()
     } catch (err) {
@@ -68,6 +110,22 @@
     } finally {
       saving = false
     }
+  }
+
+  async function save() {
+    if (!draftDate) return
+
+    const parts = fromLocalParts(draftDate, draftTime)
+    if (!parts) {
+      error = 'That is not a valid date/time'
+      return
+    }
+
+    await persist(parts.iso, parts.precision)
+  }
+
+  async function clearDate() {
+    await persist(null, null)
   }
 </script>
 
@@ -79,11 +137,25 @@
   </td>
 
   {#if editing}
-    <td class="editing">
-      <input type="datetime-local" bind:value={draft} />
-      <button type="button" class="save" onclick={save} disabled={saving || !draft}>
-        {saving ? '…' : 'Save'}
-      </button>
+    <td class="editing" colspan="2">
+      <input type="date" bind:value={draftDate} onkeydown={handleKey} use:focusOnOpen />
+      <input
+        type="time"
+        class:unset={!draftTime}
+        bind:value={draftTime}
+        onkeydown={handleKey}
+        title="Optional — leave blank if the source shows no time"
+      />
+      {#if saving}<span class="keys">saving…</span>{/if}
+      {#if publishedAt}
+        <button
+          type="button"
+          class="clear"
+          onclick={clearDate}
+          disabled={saving}
+          title="Remove this date — use it when the source's publish time is genuinely unknown"
+        >Clear</button>
+      {/if}
       <button type="button" class="cancel" onclick={() => (editing = false)}>Cancel</button>
     </td>
   {:else}
@@ -102,11 +174,25 @@
         {/if}
       </button>
     </td>
+
+    <td class="age">
+      {#if ageLabel}
+        <span
+          class:stale={age.stale}
+          class:newer={!age.older}
+          title={precision === 'date'
+            ? `${age.exact} (approximate — this source has a date but no time)`
+            : `${age.exact} than the article`}
+        >{ageLabel}</span>
+      {:else}
+        <span class="unknown">—</span>
+      {/if}
+    </td>
   {/if}
 </tr>
 
 {#if error}
-  <tr class="err-row"><td colspan="2">{error}</td></tr>
+  <tr class="err-row"><td colspan="3">{error}</td></tr>
 {/if}
 
 <style>
@@ -132,7 +218,21 @@
 
   .src a:hover { text-decoration: underline; }
 
-  .when { text-align: right; white-space: nowrap; padding-right: 0; }
+  .when { text-align: right; white-space: nowrap; }
+
+  .age {
+    text-align: right;
+    white-space: nowrap;
+    padding-right: 0;
+    font-size: 0.72rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+  }
+
+  /* Background material rather than coverage of the story. */
+  .age .stale { color: var(--danger); }
+  .age .newer { font-style: italic; }
+  .age .unknown { opacity: 0.5; }
 
   .stamp {
     padding: 0;
@@ -160,6 +260,12 @@
     background: var(--card);
   }
 
+  .editing input + input { margin-left: 0.2rem; }
+
+  /* An empty time is a legitimate answer here, so it reads as faded rather
+     than as something the form is still waiting for. */
+  .editing input.unset { opacity: 0.55; }
+
   .editing button {
     margin-left: 0.2rem;
     padding: 0.12rem 0.4rem;
@@ -170,8 +276,16 @@
     cursor: pointer;
   }
 
-  .editing .save { background: var(--accent); color: #fff; border-color: transparent; }
-  .editing .save:disabled { opacity: 0.45; cursor: default; }
+  .editing .clear:hover:not(:disabled) { color: var(--danger); border-color: currentColor; }
+  .editing .clear:disabled { opacity: 0.45; cursor: default; }
+
+  /* Only shown mid-request; Enter commits the edit without announcing itself. */
+  .editing .keys {
+    margin-left: 0.35rem;
+    font-size: 0.66rem;
+    color: var(--muted);
+    font-style: italic;
+  }
 
   .err-row td { color: var(--danger); font-size: 0.7rem; border-bottom: 0; }
 </style>

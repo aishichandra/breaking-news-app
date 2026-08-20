@@ -11,11 +11,29 @@
     return res.json()
   }
 
-  let articlesPromise = $state(loadArticles())
+  // Held as data rather than a promise the markup awaits. Re-awaiting a fresh
+  // promise unmounts every card back to "Loading…", so saving one citation date
+  // looked like a page reload — expanded answers collapsed, scroll position
+  // gone. The list stays on screen now while new data is fetched underneath it.
+  let articles = $state([])
+  let loaded = $state(false)
+  let refreshing = $state(false)
+  let loadError = $state(null)
 
-  function refresh() {
-    articlesPromise = loadArticles()
+  async function refresh() {
+    refreshing = true
+    try {
+      articles = await loadArticles()
+      loadError = null
+    } catch (err) {
+      loadError = err
+    } finally {
+      refreshing = false
+      loaded = true
+    }
   }
+
+  refresh()
 
   function handleCreated() {
     refresh()
@@ -43,23 +61,28 @@
   {#if tab === 'add'}
     <NewArticleForm onCreated={handleCreated} />
   {:else}
-    {#await articlesPromise}
+    {#if !loaded}
       <p class="status">Loading…</p>
-    {:then articles}
-      {#if articles.length === 0}
+    {:else}
+      {#if loadError}
+        <p class="status error">Couldn't load articles: {loadError.message}</p>
+      {/if}
+
+      {#if articles.length === 0 && !loadError}
         <div class="empty">
           <p>No articles yet.</p>
           <button class="primary" onclick={() => (tab = 'add')}>Add your first one</button>
         </div>
       {:else}
-        <p class="status">{articles.length} article{articles.length === 1 ? '' : 's'}</p>
+        <p class="status">
+          {articles.length} article{articles.length === 1 ? '' : 's'}
+          {#if refreshing}<span class="refreshing">refreshing…</span>{/if}
+        </p>
         {#each articles as article (article._id)}
           <ArticleCard {article} onDeleted={refresh} onCitationSaved={refresh} onUpdated={refresh} />
         {/each}
       {/if}
-    {:catch error}
-      <p class="error">Couldn't load articles: {error.message}</p>
-    {/await}
+    {/if}
   {/if}
 </main>
 
@@ -128,6 +151,10 @@
     font-size: 0.8rem;
     margin: 0 0 1rem;
   }
+
+  /* Deliberately quiet: a background refresh should be noticeable if you look
+     for it and invisible if you don't. */
+  .refreshing { margin-left: 0.4rem; font-style: italic; opacity: 0.7; }
 
   .empty {
     text-align: center;

@@ -1,6 +1,6 @@
 <script>
   import PlatformAnswer from './PlatformAnswer.svelte'
-  import { describeLag, formatDateTime, runAskedAt } from './time.js'
+  import { formatDateTime, runAskedAt } from './time.js'
   import { PLATFORM_NAMES } from './verdicts.js'
 
   let {
@@ -13,9 +13,6 @@
     onCitationSaved = () => {}
   } = $props()
 
-  function lagForRun(run) {
-    return describeLag(publishedAt, runAskedAt(run))
-  }
 </script>
 
 {#if runs.length === 0}
@@ -23,7 +20,6 @@
 {:else}
   <ol class="timeline">
     {#each runs as run, i (run.run_id)}
-      {@const lag = lagForRun(run)}
       {@const askedAt = runAskedAt(run)}
       <li class="moment">
         <div class="rail">
@@ -42,10 +38,8 @@
               {#if askedAt}
                 <time datetime={askedAt}>{formatDateTime(askedAt)}</time>
               {/if}
-              {#if lag}
-                <span class="lag" class:warn={lag.negative}>{lag.text}</span>
-              {:else if !publishedAt}
-                <span class="lag muted">set publish date to see lag</span>
+              {#if !publishedAt}
+                <span class="lag muted">set publish date to see timing</span>
               {/if}
             </div>
             <span class="run-num">{i + 1} of {runs.length}</span>
@@ -155,7 +149,6 @@
     color: var(--muted);
   }
 
-  .lag.warn { color: var(--danger); }
   .lag.muted { font-style: italic; }
 
   .run-num {

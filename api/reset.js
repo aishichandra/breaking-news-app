@@ -5,6 +5,11 @@
 //   npm run reset -- --yes   actually delete it
 import { MongoClient } from 'mongodb'
 
+if (!process.env.MONGODB_URI) {
+  console.error('MONGODB_URI is not set. Add it to api/.env before running this.')
+  process.exit(1)
+}
+
 const client = new MongoClient(process.env.MONGODB_URI)
 await client.connect()
 
