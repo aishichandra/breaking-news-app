@@ -6,7 +6,16 @@
   import { PLATFORM_NAMES, PLATFORM_LABELS, SYMBOL } from './verdicts.js'
   import { formatApproxDuration, toDate } from './time.js'
 
-  let { q, index, publishedAt, articleId, onCitationSaved = () => {} } = $props()
+  let {
+    q,
+    index,
+    publishedAt,
+    articleId,
+    onCitationSaved = () => {},
+    // Flagging is the one edit here the card above cares about: it decides
+    // which questions the update form offers to re-ask.
+    onFlagged = () => {}
+  } = $props()
 
   const questionIndex = $derived(q.question_index ?? index)
   const terms = $derived(extractKeyTerms(q.answer))
@@ -118,6 +127,7 @@
       await patch({ flagged: next })
       flagged = next
       collapsed = next
+      onFlagged()
     } catch (err) {
       error = err.message
     }

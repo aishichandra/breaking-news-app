@@ -20,7 +20,9 @@ if (!MONGODB_URI) {
 }
 
 const client = new MongoClient(MONGODB_URI)
-const db = client.db('breaking_news')
+// Overridable so the API can be pointed at a scratch database for end-to-end
+// checks without writing into the live collections.
+const db = client.db(process.env.MONGODB_DB || 'breaking_news')
 
 // A cluster can be briefly unreachable during a failover or a redeploy.
 // Exiting on the first refusal spends one of the host's restart attempts, and
@@ -388,7 +390,10 @@ app.post('/api/articles', async (req, res) => {
 
     for (const { built: q, question } of resolved) {
       for (const [platform, answer] of Object.entries(q.platforms ?? {})) {
-        if (!answer) continue
+        // Same rule the run path uses: a slot left untouched in the pasted
+        // template — no text, no citations, no session link — is a platform
+        // that was never asked. Recording it fabricates an empty response.
+        if (emptyPlatformAnswer(answer)) continue
         answerDocs.push({
           article_id: article._id,
           question_id: question.question_id,
@@ -435,9 +440,211 @@ function emptyPlatformAnswer(answer) {
   return !text && (!Array.isArray(cites) || cites.length === 0) && !answer.url
 }
 
+// Matches a batch of scraper entries onto an article's stored questions and
+// builds the answer documents for one run. Shared by the two endpoints that
+// record answers, so the rules below hold identically for both.
+//
+// `positional` is the list the caller's paste is ordered against, used for the
+// index fallback: the active questions for a plain update, or just the newly
+// added ones when questions and answers arrive together.
+function resolveRun({ article, platform_answers, runAt, positional = null }) {
+  const all = [...(article.questions ?? [])].sort(
+    (a, b) => (a.question_index ?? 0) - (b.question_index ?? 0)
+  )
+
+  // A question flagged as bad is out of the experiment. The update form already
+  // omits them from the list you copy, so a run must not be able to record
+  // answers against one — not by text, not by position, and not by inheriting
+  // its ground truth when an entry arrives without question text.
+  const active = all.filter((q) => !q.flagged)
+  const flaggedByText = new Map(
+    all.filter((q) => q.flagged).map((q) => [questionKey(q.question), q])
+  )
+
+  const order = (positional ?? active).filter((q) => !q.flagged)
+  const groundTruth = order.map((q) => ({ question: q.question, answer: q.answer }))
+
+  const built = buildQuestions(groundTruth, platform_answers)
+  const byText = new Map(active.map((q) => [questionKey(q.question), q]))
+  // Positional fallback counts through `order`, the trimmed list the caller
+  // pasted against. Keying on the stored question_index would point at whatever
+  // sits at that index in the full list — quite possibly a flagged one.
+  const byPosition = new Map(order.map((q, i) => [i, q]))
+
+  const skipped = []
+  const answerDocs = []
+  const runId = new ObjectId()
+  let matched = 0
+
+  for (const q of built) {
+    const key = questionKey(q.question)
+
+    // Checked before the positional fallback, not after: an entry naming a
+    // flagged question would otherwise miss on text and then get absorbed by
+    // whatever active question sits at its position — recording answers to the
+    // wrong question instead of declining to record them at all.
+    if (flaggedByText.has(key)) {
+      skipped.push(`${q.question} — flagged as a bad question`)
+      continue
+    }
+
+    const match = byText.get(key) ?? byPosition.get(q.question_index)
+    if (!match) {
+      skipped.push(q.question || `(question_index ${q.question_index})`)
+      continue
+    }
+
+    matched++
+    for (const [platform, answer] of Object.entries(q.platforms ?? {})) {
+      if (emptyPlatformAnswer(answer)) continue
+      answerDocs.push({
+        article_id: article._id,
+        question_id: match.question_id,
+        platform,
+        run_id: runId,
+        run_at: runAt,
+        asked_at: answer.asked_at ?? null,
+        answer: answer.answer ?? '',
+        url: answer.url ?? null,
+        citations: answer.citations ?? [],
+        verdict: null,
+        graded_at: null,
+        note: null
+      })
+    }
+  }
+
+  return { skipped, answerDocs, matched, runId }
+}
+
+// Ground-truth Q&A appended to an article after it was first entered — the
+// experiment grows a question, or a developing story earns one. Answers for the
+// new questions can ride along in the same submission; without them the
+// questions sit empty until the next update run.
+// POST /api/articles/:id/questions
+//   { questions: [{ question, answer }], platform_answers?, run_at? }
+app.post('/api/articles/:id/questions', async (req, res) => {
+  try {
+    const { id } = req.params
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: 'Not a valid article id' })
+    }
+
+    const incoming = Array.isArray(req.body) ? req.body : req.body?.questions
+    if (!Array.isArray(incoming) || incoming.length === 0) {
+      return res.status(400).json({ error: 'questions must be a non-empty array' })
+    }
+
+    // Validated before anything is written, so a bad run_at cannot leave the
+    // questions appended and the answers dropped.
+    const platform_answers = Array.isArray(req.body?.platform_answers)
+      ? req.body.platform_answers
+      : []
+
+    const runAt = req.body?.run_at ? new Date(req.body.run_at) : new Date()
+    if (Number.isNaN(runAt.getTime())) {
+      return res.status(400).json({ error: 'run_at is not a valid date' })
+    }
+
+    const articles = db.collection('articles')
+    const article = await articles.findOne({ _id: new ObjectId(id) })
+    if (!article) {
+      return res.status(404).json({ error: 'Article not found' })
+    }
+
+    const existing = article.questions ?? []
+    // Keyed by text so a duplicate can report WHY it was skipped — telling you a
+    // question is already there because you flagged it as bad is more useful
+    // than telling you it is already there.
+    const existingByKey = new Map(existing.map((q) => [questionKey(q.question), q]))
+    const seen = new Set(existingByKey.keys())
+
+    // Continue past the highest index in use rather than counting the array:
+    // if a question is ever removed, length would hand out an index that
+    // stored answers already point at.
+    let nextIndex = existing.reduce(
+      (max, q) => Math.max(max, (q.question_index ?? -1) + 1),
+      0
+    )
+
+    const added = []
+    const skipped = []
+
+    for (const entry of incoming) {
+      const question = typeof entry?.question === 'string' ? entry.question.trim() : ''
+      if (!question) {
+        skipped.push({ question: null, reason: 'no question text' })
+        continue
+      }
+
+      const key = questionKey(question)
+      if (seen.has(key)) {
+        skipped.push({
+          question,
+          reason: existingByKey.get(key)?.flagged
+            ? 'already on this article, flagged as a bad question'
+            : 'already on this article'
+        })
+        continue
+      }
+      seen.add(key)
+
+      const answer = typeof entry?.answer === 'string' ? entry.answer.trim() : ''
+      added.push({
+        question_id: new ObjectId(),
+        question_index: nextIndex++,
+        question,
+        answer: answer || null
+      })
+    }
+
+    if (added.length === 0) {
+      return res.status(400).json({ error: 'No new questions to add', skipped })
+    }
+
+    await articles.updateOne(
+      { _id: article._id },
+      { $push: { questions: { $each: added } } }
+    )
+
+    if (platform_answers.length === 0) {
+      return res.json({ ok: true, added: added.length, skipped })
+    }
+
+    // Answers pasted alongside new questions are ordered against those new
+    // questions, so they drive the positional fallback. Text matching still
+    // reaches every active question, so pasting a full scraper dump lands its
+    // answers on the existing questions too.
+    const run = resolveRun({
+      article: { ...article, questions: [...existing, ...added] },
+      platform_answers,
+      runAt,
+      positional: added
+    })
+
+    if (run.answerDocs.length > 0) {
+      await db.collection('answers').insertMany(run.answerDocs)
+    }
+
+    res.json({
+      ok: true,
+      added: added.length,
+      skipped,
+      run_id: run.answerDocs.length ? run.runId : null,
+      questions_matched: run.matched,
+      questions_skipped: run.skipped,
+      answers_recorded: run.answerDocs.length
+    })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to add questions' })
+  }
+})
+
 // New collection run against an existing article. Matches scraper entries onto
-// stored questions by text, then by question_index. Unmatched questions are
-// skipped (reported), not added.
+// stored questions by text, then by position. Questions flagged as bad are out
+// of the experiment and take no part in matching. Unmatched entries are skipped
+// (reported), not added.
 app.post('/api/articles/:id/runs', async (req, res) => {
   try {
     const { id } = req.params
@@ -461,44 +668,11 @@ app.post('/api/articles/:id/runs', async (req, res) => {
       return res.status(400).json({ error: 'run_at is not a valid date' })
     }
 
-    const groundTruth = [...(article.questions ?? [])]
-      .sort((a, b) => (a.question_index ?? 0) - (b.question_index ?? 0))
-      .map((q) => ({ question: q.question, answer: q.answer }))
-
-    const built = buildQuestions(groundTruth, platform_answers)
-    const byText = new Map((article.questions ?? []).map((q) => [questionKey(q.question), q]))
-    const byIndex = new Map((article.questions ?? []).map((q) => [q.question_index, q]))
-
-    const skipped = []
-    const answerDocs = []
-    const runId = new ObjectId()
-    let matched = 0
-
-    for (const q of built) {
-      const match = byText.get(questionKey(q.question)) ?? byIndex.get(q.question_index)
-      if (!match) {
-        skipped.push(q.question || `(question_index ${q.question_index})`)
-        continue
-      }
-      matched++
-      for (const [platform, answer] of Object.entries(q.platforms ?? {})) {
-        if (emptyPlatformAnswer(answer)) continue
-        answerDocs.push({
-          article_id: article._id,
-          question_id: match.question_id,
-          platform,
-          run_id: runId,
-          run_at: runAt,
-          asked_at: answer.asked_at ?? null,
-          answer: answer.answer ?? '',
-          url: answer.url ?? null,
-          citations: answer.citations ?? [],
-          verdict: null,
-          graded_at: null,
-          note: null
-        })
-      }
-    }
+    const { skipped, answerDocs, matched, runId } = resolveRun({
+      article,
+      platform_answers,
+      runAt
+    })
 
     if (answerDocs.length === 0) {
       return res.status(400).json({
@@ -528,7 +702,7 @@ app.post('/api/articles/:id/runs', async (req, res) => {
 
 // Article-level fields the form no longer demands up front — fill them in
 // later from the Answers view. Only keys present in the body are touched.
-// PATCH /api/articles/:id  { published_at, updated_at, snippet, markdown }
+// PATCH /api/articles/:id  { published_at, updated_at, snippet, markdown, exclusive }
 app.patch('/api/articles/:id', async (req, res) => {
   try {
     const { id } = req.params
@@ -561,6 +735,17 @@ app.patch('/api/articles/:id', async (req, res) => {
       } else {
         $set.updated_at = null
       }
+    }
+
+    // An exclusive is a story only one outlet has. Worth marking because it
+    // changes what a platform could possibly have been reading: no wire copy,
+    // no aggregators, nothing to synthesise an answer from but the original.
+    if ('exclusive' in body) {
+      if (typeof body.exclusive !== 'boolean') {
+        return res.status(400).json({ error: 'exclusive must be true or false' })
+      }
+      $set.exclusive = body.exclusive
+      $set.exclusive_at = body.exclusive ? new Date() : null
     }
 
     if ('snippet' in body) {
