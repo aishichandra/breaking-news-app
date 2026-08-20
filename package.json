@@ -1,0 +1,12 @@
+{
+  "name": "breaking-news-app",
+  "private": true,
+  "description": "Benchmarking how AI platforms answer questions about breaking news",
+  "scripts": {
+    "build": "npm install --prefix api && npm install --prefix web && npm run build --prefix web",
+    "start": "node api/server.js",
+    "dev:api": "npm run dev --prefix api",
+    "dev:web": "npm run dev --prefix web",
+    "import:csv": "python3 tools/import_manual_csv.py"
+  }
+}
