@@ -34,7 +34,7 @@
       <button class:active={tab === 'add'} onclick={() => (tab = 'add')}>
         Add data
       </button>
-      <a class="export" href="{API}/api/export.csv">Export CSV</a>
+      <a class="export" href="{API}/api/export.json">Export JSON</a>
     </nav>
   </div>
 </header>
@@ -54,7 +54,7 @@
       {:else}
         <p class="status">{articles.length} article{articles.length === 1 ? '' : 's'}</p>
         {#each articles as article (article._id)}
-          <ArticleCard {article} onDeleted={refresh} onCitationSaved={refresh} />
+          <ArticleCard {article} onDeleted={refresh} onCitationSaved={refresh} onUpdated={refresh} />
         {/each}
       {/if}
     {:catch error}

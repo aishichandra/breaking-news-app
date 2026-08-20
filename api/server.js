@@ -4,7 +4,7 @@ import { createHash, timingSafeEqual } from 'node:crypto'
 import express from 'express'
 import cors from 'cors'
 import { MongoClient, ObjectId } from 'mongodb'
-import { buildQuestions, normalizeEntry, PLATFORMS } from './normalize.js'
+import { buildQuestions } from './normalize.js'
 import { milestoneForRun, runAskedAt } from './reask-schedule.js'
 
 const client = new MongoClient(process.env.MONGODB_URI)
@@ -356,6 +356,104 @@ app.post('/api/articles', async (req, res) => {
   }
 })
 
+function emptyPlatformAnswer(answer) {
+  if (!answer) return true
+  const text = typeof answer.answer === 'string' ? answer.answer.trim() : ''
+  const cites = answer.citations ?? []
+  return !text && (!Array.isArray(cites) || cites.length === 0) && !answer.url
+}
+
+// New collection run against an existing article. Matches scraper entries onto
+// stored questions by text, then by question_index. Unmatched questions are
+// skipped (reported), not added.
+app.post('/api/articles/:id/runs', async (req, res) => {
+  try {
+    const { id } = req.params
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: 'Not a valid article id' })
+    }
+
+    const platform_answers = req.body?.platform_answers
+    if (!Array.isArray(platform_answers) || platform_answers.length === 0) {
+      return res.status(400).json({ error: 'platform_answers must be a non-empty array' })
+    }
+
+    const articles = db.collection('articles')
+    const article = await articles.findOne({ _id: new ObjectId(id) })
+    if (!article) {
+      return res.status(404).json({ error: 'Article not found' })
+    }
+
+    const runAt = req.body.run_at ? new Date(req.body.run_at) : new Date()
+    if (Number.isNaN(runAt.getTime())) {
+      return res.status(400).json({ error: 'run_at is not a valid date' })
+    }
+
+    const groundTruth = [...(article.questions ?? [])]
+      .sort((a, b) => (a.question_index ?? 0) - (b.question_index ?? 0))
+      .map((q) => ({ question: q.question, answer: q.answer }))
+
+    const built = buildQuestions(groundTruth, platform_answers)
+    const byText = new Map((article.questions ?? []).map((q) => [questionKey(q.question), q]))
+    const byIndex = new Map((article.questions ?? []).map((q) => [q.question_index, q]))
+
+    const skipped = []
+    const answerDocs = []
+    const runId = new ObjectId()
+    let matched = 0
+
+    for (const q of built) {
+      const match = byText.get(questionKey(q.question)) ?? byIndex.get(q.question_index)
+      if (!match) {
+        skipped.push(q.question || `(question_index ${q.question_index})`)
+        continue
+      }
+      matched++
+      for (const [platform, answer] of Object.entries(q.platforms ?? {})) {
+        if (emptyPlatformAnswer(answer)) continue
+        answerDocs.push({
+          article_id: article._id,
+          question_id: match.question_id,
+          platform,
+          run_id: runId,
+          run_at: runAt,
+          asked_at: answer.asked_at ?? null,
+          answer: answer.answer ?? '',
+          url: answer.url ?? null,
+          citations: answer.citations ?? [],
+          verdict: null,
+          graded_at: null,
+          note: null
+        })
+      }
+    }
+
+    if (answerDocs.length === 0) {
+      return res.status(400).json({
+        error: skipped.length
+          ? `None of the pasted questions matched this article. Unmatched: ${skipped.slice(0, 3).join('; ')}`
+          : 'No platform answers to record (empty slots are ignored)'
+      })
+    }
+
+    await db.collection('answers').insertMany(answerDocs)
+    const runNumber = await db.collection('answers').distinct('run_id', { article_id: article._id })
+
+    res.status(201).json({
+      ok: true,
+      article_id: article._id,
+      run_id: runId,
+      run_number: runNumber.length,
+      questions_matched: matched,
+      questions_skipped: skipped,
+      answers_recorded: answerDocs.length
+    })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to record update' })
+  }
+})
+
 // Article-level fields the form no longer demands up front — fill them in
 // later from the Answers view. Only keys present in the body are touched.
 // PATCH /api/articles/:id  { published_at, snippet }
@@ -551,94 +649,34 @@ app.post('/api/sources', async (req, res) => {
   }
 })
 
-// Flat CSV: one row per article x question x platform. That's the tidy shape
-// for pandas/R — every row is one observation, no nested columns to unpack.
-// GET /api/export.csv
-function csvCell(value) {
-  if (value === null || value === undefined) return ''
-  const text = value instanceof Date ? value.toISOString() : String(value)
-  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
-}
-
-const EXPORT_COLUMNS = [
-  'article_id', 'article_url', 'article_published_at', 'article_snippet',
-  'question_index', 'question', 'ground_truth',
-  'flagged', 'answerable_from_snippet', 'answerable_from_history', 'notes',
-  'platform', 'answer', 'verdict', 'verdict_note', 'graded_at',
-  'asked_at', 'run_at', 'lag_hours',
-  'citation_count', 'citations_dated', 'oldest_citation_at', 'newest_citation_at',
-  'citations_older_than_article', 'session_url'
-]
-
-app.get('/api/export.csv', async (req, res) => {
+// Full dump of the collections as stored in MongoDB — articles, answers, and
+// sources — so nothing collected is flattened away.
+// GET /api/export.json
+app.get('/api/export.json', async (req, res) => {
   try {
-    const articles = await attachSourceDates(
-      await attachLatestRun(await db.collection('articles').find().toArray())
-    )
+    const [articles, answers, sources] = await Promise.all([
+      db.collection('articles').find().toArray(),
+      db.collection('answers').find().toArray(),
+      db.collection('sources').find().toArray()
+    ])
 
-    const rows = [EXPORT_COLUMNS.join(',')]
+    const payload = { articles, answers, sources }
+    const stamp = new Date().toISOString().slice(0, 10)
 
-    for (const article of articles) {
-      const publishedAt = article.published_at ? new Date(article.published_at) : null
-
-      for (const question of article.questions ?? []) {
-        for (const platform of PLATFORMS) {
-          const answer = question.platforms?.[platform]
-          const askedAt = answer?.asked_at
-            ? new Date(answer.asked_at)
-            : question.asked_at
-              ? new Date(question.asked_at)
-              : null
-          const runAt = answer?.run_at ? new Date(answer.run_at) : null
-
-          const dated = (answer?.citations ?? [])
-            .map((c) => (c.source_published_at ? new Date(c.source_published_at) : null))
-            .filter(Boolean)
-            .sort((a, b) => a - b)
-
-          rows.push([
-            article._id,
-            article.url,
-            publishedAt,
-            article.snippet,
-            question.question_index,
-            question.question,
-            question.answer,
-            question.flagged ?? false,
-            question.answerable_from_snippet,
-            question.answerable_from_history,
-            question.notes,
-            platform,
-            answer?.answer,
-            answer?.verdict,
-            answer?.note,
-            answer?.graded_at ? new Date(answer.graded_at) : null,
-            askedAt,
-            runAt,
-            publishedAt && askedAt
-              ? ((askedAt - publishedAt) / 3600000).toFixed(2)
-              : null,
-            answer?.citations?.length ?? 0,
-            dated.length,
-            dated[0] ?? null,
-            dated[dated.length - 1] ?? null,
-            publishedAt ? dated.filter((d) => d < publishedAt).length : null,
-            answer?.url
-          ].map(csvCell).join(','))
-        }
-      }
-    }
-
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+    res.setHeader('Content-Type', 'application/json; charset=utf-8')
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="benchmark-${new Date().toISOString().slice(0, 10)}.csv"`
+      `attachment; filename="breaking-news-${stamp}.json"`
     )
-    res.send(rows.join('\n'))
+    res.send(JSON.stringify(payload, null, 2))
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Failed to build export' })
   }
+})
+
+app.get('/api/export.csv', (req, res) => {
+  res.redirect(301, '/api/export.json')
 })
 
 // Grade one answer — that is, one platform's response in one specific run.

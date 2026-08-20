@@ -2,9 +2,10 @@
   import { API } from './api.js'
   import QuestionBlock from './QuestionBlock.svelte'
   import { untrack } from 'svelte'
+  import { parseArrayField } from './parseData.js'
   import { formatDateTime, toLocalInputValue } from './time.js'
 
-  let { article, onDeleted, onCitationSaved = () => {} } = $props()
+  let { article, onDeleted, onCitationSaved = () => {}, onUpdated = () => {} } = $props()
 
 
   let deleting = $state(false)
@@ -87,6 +88,66 @@
       deleting = false
     }
   }
+
+  let addingUpdate = $state(false)
+  let platformJson = $state('')
+  let savingUpdate = $state(false)
+  let updateNote = $state(null)
+  let copiedQuestions = $state(false)
+
+  const activeQuestionList = $derived(
+    JSON.stringify(
+      (article.questions ?? [])
+        .filter((q) => !q.flagged)
+        .map((q) => q.question ?? ''),
+      null,
+      2
+    )
+  )
+
+  async function copyQuestions() {
+    try {
+      await navigator.clipboard.writeText(activeQuestionList)
+      copiedQuestions = true
+      setTimeout(() => (copiedQuestions = false), 1500)
+    } catch {
+      error = 'Could not copy questions'
+    }
+  }
+
+  async function submitUpdate(event) {
+    event.preventDefault()
+    savingUpdate = true
+    error = null
+    updateNote = null
+
+    try {
+      const platform_answers = parseArrayField(platformJson, 'Platform answers')
+      if (platform_answers.length === 0) {
+        throw new Error('Paste the platform JSON — at least one question entry')
+      }
+
+      const res = await fetch(`${API}/api/articles/${article._id}/runs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ platform_answers })
+      })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(body.error ?? `API returned ${res.status}`)
+
+      const skipped = body.questions_skipped?.length
+        ? ` Skipped ${body.questions_skipped.length} unmatched question(s).`
+        : ''
+      updateNote = `Recorded ${body.answers_recorded} answer(s) across ${body.questions_matched} question(s).${skipped}`
+      platformJson = ''
+      addingUpdate = false
+      onUpdated()
+    } catch (err) {
+      error = err.message
+    } finally {
+      savingUpdate = false
+    }
+  }
 </script>
 
 <article class="card">
@@ -130,16 +191,49 @@
       {/if}
     </div>
 
-    <button class="delete" onclick={handleDelete} disabled={deleting}>
-      {deleting ? 'Deleting…' : 'Delete'}
-    </button>
+    <div class="actions">
+      <button
+        type="button"
+        class="update"
+        onclick={() => { addingUpdate = !addingUpdate; error = null }}
+      >{addingUpdate ? 'Cancel update' : 'Add update'}</button>
+      <button class="delete" onclick={handleDelete} disabled={deleting}>
+        {deleting ? 'Deleting…' : 'Delete'}
+      </button>
+    </div>
   </header>
+
+  {#if addingUpdate}
+    <form class="update-form" onsubmit={submitUpdate}>
+      <div class="qlist">
+        <div class="qlist-head">
+          <span>Questions to re-ask</span>
+          <button type="button" class="mini" onclick={copyQuestions}>
+            {copiedQuestions ? 'Copied' : 'Copy'}
+          </button>
+        </div>
+        <pre class="code">{activeQuestionList}</pre>
+      </div>
+      <label>
+        Platform answers
+        <span class="hint">Paste the new scraper JSON for this article. Flagged questions are omitted above. Remaining questions are matched by text (then index).</span>
+        <textarea class="code" bind:value={platformJson} rows="8" required placeholder="[]"></textarea>
+      </label>
+      <button type="submit" disabled={savingUpdate}>
+        {savingUpdate ? 'Saving…' : 'Save update'}
+      </button>
+    </form>
+  {/if}
+
+  {#if updateNote}
+    <p class="note">{updateNote}</p>
+  {/if}
 
   {#if error}
     <p class="error">{error}</p>
   {/if}
 
-  {#each article.questions ?? [] as q, i}
+  {#each article.questions ?? [] as q, i (`${q.question_id}:${q.runs?.length ?? 0}`)}
     <QuestionBlock
       {q}
       index={i}
@@ -168,7 +262,67 @@
   .meta { min-width: 0; }
   .meta a { font-size: 0.8rem; font-weight: 550; color: #2b3a52; word-break: break-all; }
   .date { color: #6b7791; font-size: 0.75rem; margin: 0.3rem 0 0; }
+  .actions { display: flex; flex-shrink: 0; gap: 0.4rem; }
+  .update { padding: 0.3rem 0.7rem; font: inherit; font-size: 0.75rem; color: var(--text); background: var(--card); border: 1px solid #dfe4ec; cursor: pointer; }
+  .update:hover { border-color: var(--muted); }
   .delete { flex-shrink: 0; padding: 0.3rem 0.7rem; font: inherit; font-size: 0.75rem; color: var(--danger); background: var(--card); border: 1px solid #dfe4ec; cursor: pointer; }
+
+  .update-form {
+    margin: 0.9rem 0 0.4rem;
+    padding: 0.85rem 0.9rem;
+    background: #f7f8fb;
+    border: 1px solid #dfe4ec;
+  }
+  .update-form label { display: block; font-size: 0.8rem; font-weight: 550; }
+  .update-form .hint {
+    display: block;
+    font-weight: 400;
+    font-size: 0.72rem;
+    color: var(--muted);
+    font-style: italic;
+  }
+  .qlist { margin-bottom: 0.9rem; }
+  .qlist-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin-bottom: 0.35rem;
+    font-size: 0.8rem;
+    font-weight: 550;
+  }
+  .qlist pre.code,
+  .update-form textarea.code {
+    display: block;
+    width: 100%;
+    margin: 0.4rem 0 0.7rem;
+    padding: 0.5rem 0.6rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.75rem;
+    line-height: 1.5;
+    white-space: pre;
+    resize: vertical;
+    border: 1px solid #dfe4ec;
+  }
+  .qlist pre.code {
+    margin: 0;
+    max-height: 14rem;
+    overflow: auto;
+    white-space: pre-wrap;
+    background: var(--card);
+  }
+  .update-form button[type='submit'] {
+    padding: 0.4rem 0.9rem;
+    font: inherit;
+    font-size: 0.8rem;
+    font-weight: 550;
+    color: #fff;
+    background: var(--accent);
+    border: 0;
+    cursor: pointer;
+  }
+  .update-form button[type='submit']:disabled { opacity: 0.45; cursor: default; }
+  .note { margin: 0.65rem 0 0; font-size: 0.78rem; color: #0a6b3d; }
   .delete:hover:not(:disabled) { background: var(--danger); border-color: transparent; color: #fff; }
   .delete:disabled { opacity: 0.5; cursor: default; }
   .snippet { margin: 0.55rem 0 0; font-size: 0.8rem; line-height: 1.55; color: #3d4a61; max-width: 90ch; }

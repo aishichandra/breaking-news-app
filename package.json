@@ -2,6 +2,9 @@
   "name": "breaking-news-app",
   "private": true,
   "description": "Benchmarking how AI platforms answer questions about breaking news",
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "build": "npm install --prefix api && npm install --prefix web && npm run build --prefix web",
     "start": "node api/server.js",

@@ -30,6 +30,26 @@ export function formatDuration(ms) {
   return parts.join(' ')
 }
 
+// Compact lag for collapsed verdict chips — nearest useful unit, not exact minutes.
+export function formatApproxDuration(ms) {
+  const sign = ms < 0 ? '−' : ''
+  const abs = Math.abs(ms)
+  const minutes = abs / 60000
+
+  if (minutes < 12) return `${sign}<15m`
+  if (minutes < 50) return `${sign}~${Math.round(minutes / 5) * 5}m`
+
+  const hours = abs / 3600000
+  if (hours < 1.75) return `${sign}~1h`
+  if (hours < 20) return `${sign}~${Math.round(hours)}h`
+
+  const days = abs / 86400000
+  if (days < 1.75) return `${sign}~1d`
+  if (days < 5.5) return `${sign}~${Math.round(days)}d`
+  if (days < 10) return `${sign}~1w`
+  return `${sign}~${Math.round(days / 7)}w`
+}
+
 // How stale was the news when the platform was asked?
 // Positive = asked after publication (the normal case).
 // Negative = asked before the article existed, which means either a

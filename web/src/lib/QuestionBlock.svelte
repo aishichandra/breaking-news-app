@@ -4,20 +4,12 @@
   import QuestionTimeline from './QuestionTimeline.svelte'
   import { extractKeyTerms } from './highlight.js'
   import { PLATFORM_NAMES, PLATFORM_LABELS, SYMBOL } from './verdicts.js'
+  import { formatApproxDuration, toDate } from './time.js'
 
   let { q, index, publishedAt, articleId, onCitationSaved = () => {} } = $props()
 
   const questionIndex = $derived(q.question_index ?? index)
   const terms = $derived(extractKeyTerms(q.answer))
-
-  const RUN_LABEL = {
-    early: '<15mins',
-    '1h': '1h',
-    '5h': '5h',
-    '1d': '1d',
-    '1w': '1w',
-    late: 'later'
-  }
 
   function snapshotRuns(runs) {
     return Object.fromEntries(
@@ -35,16 +27,18 @@
   let runVerdicts = $state(untrack(() => snapshotRuns(q.runs)))
   const latestRunId = $derived(String(q.runs?.at(-1)?.run_id ?? ''))
 
-  const runCount = $derived(q.runs?.length ?? 0)
-
   const progression = $derived(
     (q.runs ?? []).map((run, i) => {
       const id = String(run.run_id)
       const marks = runVerdicts[id] ?? {}
       const names = PLATFORM_NAMES.filter((n) => run.platforms?.[n]?.answer)
+      const pub = toDate(publishedAt)
+      const asked = toDate(run.asked_at)
+      const lagMs = pub && asked ? asked - pub : null
       return {
         id,
-        label: RUN_LABEL[run.milestone?.id] ?? run.milestone?.label ?? `${i + 1}`,
+        lag: lagMs == null ? null : formatApproxDuration(lagMs),
+        lagNegative: lagMs != null && lagMs < 0,
         names,
         marks,
         done: names.length > 0 && names.every((n) => marks[n])
@@ -134,36 +128,43 @@
 <section class="question" class:flagged class:collapsed>
   <header>
     <div class="qcol">
-      <h3>
-        <button type="button" class="qbtn" onclick={() => (collapsed = !collapsed)}>
+      <button
+        type="button"
+        class="expander"
+        aria-expanded={!collapsed}
+        onclick={() => (collapsed = !collapsed)}
+      >
+        <span class="chevron" aria-hidden="true">{collapsed ? '▸' : '▾'}</span>
+        <span class="expander-body">
           <span class="qtext">{q.question}</span>
-        </button>
-      </h3>
-
-      {#if collapsed && progression.length > 0}
-        <ol class="progress">
-          {#each progression as step, i (step.id)}
-            {#if i > 0}<li class="sep" aria-hidden="true">→</li>{/if}
-            <li class="step" class:done={step.done}>
-              {#if runCount > 1}<span class="when">{step.label}</span>{/if}
-              <span class="grades">
-                {#each step.names as name}
-                  <span
-                    class="chip {step.marks[name] ?? 'ungraded'}"
-                    title="{PLATFORM_LABELS[name]}{step.marks[name] ? ` — ${step.marks[name]}` : ' — ungraded'}"
-                  >{step.marks[name] ? SYMBOL[step.marks[name]] : '·'}</span>
-                {/each}
-              </span>
-            </li>
-          {/each}
-        </ol>
-      {:else if !collapsed}
-        {#if q.answer}
-          <p class="answer-line"><span class="arrow">→</span><span class="truth">{q.answer}</span></p>
-        {:else}
-          <p class="answer-line no-answer"><span class="arrow">→</span>no ground-truth answer recorded</p>
-        {/if}
-      {/if}
+          {#if collapsed && progression.length > 0}
+            <span class="progress">
+              {#each progression as step, i (step.id)}
+                {#if i > 0}<span class="sep" aria-hidden="true">→</span>{/if}
+                <span class="step" class:done={step.done}>
+                  {#if step.lag}
+                    <span class="when" class:warn={step.lagNegative}>{step.lag}</span>
+                  {/if}
+                  <span class="grades">
+                    {#each step.names as name}
+                      <span
+                        class="chip {step.marks[name] ?? 'ungraded'}"
+                        title="{PLATFORM_LABELS[name]}{step.marks[name] ? ` — ${step.marks[name]}` : ' — ungraded'}"
+                      >{step.marks[name] ? SYMBOL[step.marks[name]] : '·'}</span>
+                    {/each}
+                  </span>
+                </span>
+              {/each}
+            </span>
+          {:else if !collapsed}
+            {#if q.answer}
+              <span class="answer-line"><span class="arrow">→</span><span class="truth">{q.answer}</span></span>
+            {:else}
+              <span class="answer-line no-answer"><span class="arrow">→</span>no ground-truth answer recorded</span>
+            {/if}
+          {/if}
+        </span>
+      </button>
     </div>
 
     <div class="meta">
@@ -180,10 +181,6 @@
         aria-pressed={fromHistory === 'yes'}
         onclick={() => setJudgment('answerable_from_history', 'yes')}
       >answerable from older reporting</button>
-
-      <button class="link" onclick={() => (collapsed = !collapsed)}>
-        {collapsed ? 'show answers' : 'hide answers'}
-      </button>
 
       {#if flagged}
         <button class="link" onclick={toggleFlag}>unflag</button>
@@ -238,22 +235,45 @@
 
   .qcol { flex: 1 1 30rem; min-width: 0; }
 
-  h3 { font-size: 1rem; font-weight: 600; line-height: 1.5; margin: 0; }
-  .qbtn {
-    padding: 0;
+  .expander {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.45rem;
+    width: 100%;
+    margin: -0.35rem -0.5rem;
+    padding: 0.4rem 0.5rem;
     font: inherit;
-    font-weight: inherit;
     color: inherit;
+    text-align: left;
     background: none;
     border: 0;
     cursor: pointer;
-    text-align: left;
   }
-  .question.collapsed h3 { font-size: 0.85rem; font-weight: 550; }
+  .expander:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .chevron {
+    flex-shrink: 0;
+    margin-top: 0.12rem;
+    width: 0.9rem;
+    font-size: 0.85rem;
+    line-height: 1.3;
+    color: var(--muted);
+  }
+  .expander:hover .chevron { color: var(--text); }
+  .expander-body { min-width: 0; flex: 1; }
+  .qtext {
+    display: block;
+    font-size: 1rem;
+    font-weight: 600;
+    line-height: 1.5;
+  }
+  .question.collapsed .qtext { font-size: 0.85rem; font-weight: 550; }
   .question.flagged .qtext { text-decoration: line-through; text-decoration-color: var(--muted); }
 
   /* Indented to sit under the question text, clear of the Q-number. */
-  .answer-line { margin: 0.15rem 0 0; font-size: 0.82rem; line-height: 1.5; }
+  .answer-line { display: block; margin: 0.15rem 0 0; font-size: 0.82rem; line-height: 1.5; }
   .arrow { margin-right: 0.4rem; color: var(--muted); }
   .truth { padding: 0.08rem 0.3rem; background: #ffe89a; font-weight: 600; }
   .no-answer { color: var(--muted); font-style: italic; }
@@ -282,6 +302,8 @@
   }
 
   .progress .step.done .when { color: #0a6b3d; }
+  .progress .when.warn,
+  .progress .step.done .when.warn { color: var(--danger); }
 
   .progress .sep {
     color: var(--line);
