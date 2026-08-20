@@ -971,7 +971,7 @@ app.get('/api/export.csv', (req, res) => {
 })
 
 // Grade one answer — that is, one platform's response in one specific run.
-// PATCH /api/answers/:id  { verdict, note }
+// PATCH /api/answers/:id  { verdict, note, answer }
 app.patch('/api/answers/:id', async (req, res) => {
   try {
     const { id } = req.params
@@ -979,7 +979,8 @@ app.patch('/api/answers/:id', async (req, res) => {
       return res.status(400).json({ error: 'Not a valid answer id' })
     }
 
-    const { verdict, note } = req.body ?? {}
+    const body = req.body ?? {}
+    const { verdict, note, answer } = body
     if (verdict !== null && verdict !== undefined && !VERDICTS.includes(verdict)) {
       return res
         .status(400)
@@ -987,13 +988,38 @@ app.patch('/api/answers/:id', async (req, res) => {
     }
 
     const $set = {}
-    if ('verdict' in (req.body ?? {})) {
+    if ('verdict' in body) {
       $set.verdict = verdict ?? null
       $set.graded_at = verdict ? new Date() : null
     }
-    if ('note' in (req.body ?? {})) {
+    if ('note' in body) {
       const text = typeof note === 'string' ? note.trim() : ''
       $set.note = text || null
+    }
+
+    // A scrape that mangled the response — truncated it, dropped a paragraph,
+    // swallowed the markup — can be corrected by hand. What the platform
+    // actually returned is the evidence this whole study rests on, though, so
+    // the first correction stashes the scraped text under `answer_original`
+    // and later ones leave that untouched. Both fields go out in the export.
+    if ('answer' in body) {
+      if (typeof answer !== 'string') {
+        return res.status(400).json({ error: 'answer must be a string' })
+      }
+
+      const existing = await db
+        .collection('answers')
+        .findOne({ _id: new ObjectId(id) }, { projection: { answer: 1, answer_original: 1 } })
+
+      if (!existing) {
+        return res.status(404).json({ error: 'Answer not found' })
+      }
+
+      $set.answer = answer.trim()
+      $set.answer_edited_at = new Date()
+      if (existing.answer_original === undefined) {
+        $set.answer_original = existing.answer ?? ''
+      }
     }
 
     if (Object.keys($set).length === 0) {
@@ -1009,10 +1035,16 @@ app.patch('/api/answers/:id', async (req, res) => {
       return res.status(404).json({ error: 'Answer not found' })
     }
 
-    res.json({ ok: true, verdict })
+    res.json({
+      ok: true,
+      verdict,
+      answer: $set.answer,
+      answer_original: $set.answer_original,
+      answer_edited_at: $set.answer_edited_at
+    })
   } catch (err) {
     console.error(err)
-    res.status(500).json({ error: 'Failed to save verdict' })
+    res.status(500).json({ error: 'Failed to save answer' })
   }
 })
 

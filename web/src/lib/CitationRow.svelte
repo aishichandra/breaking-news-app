@@ -134,6 +134,37 @@
     <a href={citation.url} target="_blank" rel="noreferrer" title={citation.label}>
       {domain}
     </a>
+
+    {#if citation.trust}
+      <!-- Only Perplexity reports this, and only ever as "Trusted" — but the
+           label is rendered from the stored value rather than assumed, so a new
+           one shows up as itself instead of silently reading as trusted. -->
+      <span class="trust" title="{citation.trust} — the platform's own label for this source">
+        <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+          <path
+            d="M8 1.4 3.2 3.2v4.3c0 3 2 5.6 4.8 6.8 2.8-1.2 4.8-3.8 4.8-6.8V3.2L8 1.4Z"
+            fill="currentColor"
+            opacity="0.15"
+          />
+          <path
+            d="M8 1.4 3.2 3.2v4.3c0 3 2 5.6 4.8 6.8 2.8-1.2 4.8-3.8 4.8-6.8V3.2L8 1.4Z"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.2"
+            stroke-linejoin="round"
+          />
+          <path
+            d="m5.9 7.9 1.5 1.6 2.8-3.2"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+        <span class="sr">{citation.trust}</span>
+      </span>
+    {/if}
   </td>
 
   {#if editing}
@@ -204,15 +235,38 @@
 
   tr:last-child td { border-bottom: 0; }
 
-  .src { max-width: 11rem; }
+  /* Flex so the badge keeps its place while the domain takes the slack and
+     ellipsises — a long host must not push the shield out of the cell. */
+  .src {
+    display: flex;
+    align-items: center;
+    gap: 0.28rem;
+    max-width: 11rem;
+  }
 
   .src a {
-    display: block;
+    min-width: 0;
     color: var(--text);
     text-decoration: none;
     font-weight: 600;
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .trust {
+    display: inline-flex;
+    flex-shrink: 0;
+    color: #0a6b3d;
+  }
+
+  /* Visible to screen readers, not to the layout. */
+  .sr {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
     white-space: nowrap;
   }
 

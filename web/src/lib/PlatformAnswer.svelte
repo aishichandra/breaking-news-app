@@ -3,7 +3,7 @@
   import { API } from './api.js'
   import CitationRow from './CitationRow.svelte'
   import { highlightSegments } from './highlight.js'
-  import { describeLag } from './time.js'
+  import { describeLag, formatDateTime } from './time.js'
   import { PLATFORM_LABELS as LABELS, VERDICTS } from './verdicts.js'
 
   let {
@@ -23,9 +23,17 @@
   )
 
 
-  const segments = $derived(highlightSegments(result?.answer ?? '', terms))
-  const isLong = $derived((result?.answer?.length ?? 0) > 420)
   const citations = $derived(result?.citations ?? [])
+
+  // The answer text is held locally rather than read straight off the prop,
+  // because a correction has to stay on screen after it is saved — the parent
+  // only refetches on its own schedule.
+  let answerText = $state(untrack(() => result?.answer ?? ''))
+  let originalAnswer = $state(untrack(() => result?.answer_original ?? null))
+  let editedAt = $state(untrack(() => result?.answer_edited_at ?? null))
+
+  const segments = $derived(highlightSegments(answerText, terms))
+  const isLong = $derived(answerText.length > 420)
 
   let expanded = $state(false)
   let verdict = $state(untrack(() => result?.verdict ?? null))
@@ -34,6 +42,35 @@
   let savingNote = $state(false)
   let saveError = $state(null)
   let commenting = $state(false)
+
+  let editingAnswer = $state(false)
+  let draftAnswer = $state('')
+  let savingAnswer = $state(false)
+
+  // Only worth offering when there is something to go back to: an edit made to
+  // fill in a blank scrape has nothing useful to restore.
+  const canRestore = $derived(
+    typeof originalAnswer === 'string' &&
+      originalAnswer.trim() !== '' &&
+      originalAnswer !== draftAnswer
+  )
+
+  // Follows the incoming prop while the editor is closed, so a refetch
+  // elsewhere on the page still lands here. `editingAnswer` is read untracked:
+  // as a dependency it would re-run the moment a save closes the editor and
+  // paint the pre-edit prop back over the text just saved.
+  $effect(() => {
+    const incoming = result?.answer ?? ''
+    const incomingOriginal = result?.answer_original ?? null
+    const incomingEditedAt = result?.answer_edited_at ?? null
+
+    untrack(() => {
+      if (editingAnswer) return
+      answerText = incoming
+      originalAnswer = incomingOriginal
+      editedAt = incomingEditedAt
+    })
+  })
 
   async function patchAnswer(body) {
     const res = await fetch(`${API}/api/answers/${result._id}`, {
@@ -45,6 +82,7 @@
       const detail = await res.json().catch(() => ({}))
       throw new Error(detail.error ?? `API returned ${res.status}`)
     }
+    return res.json().catch(() => ({}))
   }
 
   async function setVerdict(next) {
@@ -77,6 +115,61 @@
     }
   }
 
+  function openAnswerEdit() {
+    draftAnswer = answerText
+    editingAnswer = true
+    saveError = null
+  }
+
+  function cancelAnswerEdit() {
+    editingAnswer = false
+    saveError = null
+  }
+
+  // Enter has to stay a newline in a body of prose, so the shortcut is the
+  // usual modifier pair; Escape backs out the way the citation editor does.
+  function handleAnswerKey(event) {
+    if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault()
+      if (!savingAnswer) saveAnswer()
+    } else if (event.key === 'Escape') {
+      event.preventDefault()
+      cancelAnswerEdit()
+    }
+  }
+
+  // Correcting a scrape leaves the platform's own text intact server-side, so
+  // the reply carries back whichever of those fields the save established.
+  async function saveAnswer() {
+    const next = draftAnswer.trim()
+    if (next === answerText) {
+      cancelAnswerEdit()
+      return
+    }
+
+    savingAnswer = true
+    saveError = null
+
+    try {
+      const saved = await patchAnswer({ answer: next })
+      answerText = saved.answer ?? next
+      if (saved.answer_original != null) originalAnswer = saved.answer_original
+      editedAt = saved.answer_edited_at ?? new Date().toISOString()
+      editingAnswer = false
+    } catch (err) {
+      saveError = err.message
+    } finally {
+      savingAnswer = false
+    }
+  }
+
+  // Puts the caret at the end rather than at character zero: a truncated answer
+  // is fixed at the bottom, which is also where the textarea should be sitting.
+  function focusOnOpen(node) {
+    node.focus()
+    node.setSelectionRange(node.value.length, node.value.length)
+  }
+
   function startComment() {
     commenting = true
   }
@@ -91,6 +184,12 @@
 <div class="platform" data-verdict={verdict}>
   <div class="head">
     <span class="name">{LABELS[name] ?? name}</span>
+    {#if editedAt}
+      <span
+        class="edited"
+        title="Answer corrected by hand on {formatDateTime(editedAt)} — the scraped text is kept as answer_original in the export"
+      >edited</span>
+    {/if}
     {#if result?.url}
       <a class="session" href={result.url} target="_blank" rel="noreferrer">↗</a>
     {/if}
@@ -105,14 +204,49 @@
       </p>
     {/if}
 
-    <p class="answer" class:clamped={isLong && !expanded}>
-      {#each segments as seg}{#if seg.kind}<mark class={seg.kind}>{seg.text}</mark>{:else}{seg.text}{/if}{/each}
-    </p>
+    {#if editingAnswer}
+      <div class="answer-edit">
+        <textarea
+          bind:value={draftAnswer}
+          rows="12"
+          onkeydown={handleAnswerKey}
+          use:focusOnOpen
+          placeholder="What the platform actually said…"
+        ></textarea>
+        <div class="answer-actions">
+          <button type="button" class="save-note" onclick={saveAnswer} disabled={savingAnswer}>
+            {savingAnswer ? 'Saving…' : 'Save answer'}
+          </button>
+          <button type="button" class="link" onclick={cancelAnswerEdit}>Cancel</button>
+          {#if canRestore}
+            <button
+              type="button"
+              class="link"
+              onclick={() => (draftAnswer = originalAnswer)}
+              title="Put the originally scraped text back in the box"
+            >restore scraped text</button>
+          {/if}
+        </div>
+      </div>
+    {:else}
+      {#if answerText}
+        <p class="answer" class:clamped={isLong && !expanded}>
+          {#each segments as seg}{#if seg.kind}<mark class={seg.kind}>{seg.text}</mark>{:else}{seg.text}{/if}{/each}
+        </p>
+      {:else}
+        <p class="none">No answer text captured</p>
+      {/if}
 
-    {#if isLong}
-      <button class="link" onclick={() => (expanded = !expanded)}>
-        {expanded ? 'Show less' : 'Show more'}
-      </button>
+      <div class="answer-tools">
+        {#if isLong}
+          <button class="link" onclick={() => (expanded = !expanded)}>
+            {expanded ? 'Show less' : 'Show more'}
+          </button>
+        {/if}
+        <button class="link" onclick={openAnswerEdit}>
+          {answerText ? 'edit answer' : 'add answer text'}
+        </button>
+      </div>
     {/if}
 
     <div class="cites">
@@ -207,6 +341,20 @@
 
   .session { font-size: 0.75rem; color: var(--muted); text-decoration: none; }
 
+  /* Sits with the platform name; the auto margin keeps the session link on the
+     far right rather than letting three items space themselves evenly. */
+  .edited {
+    margin-right: auto;
+    padding: 0 0.25rem;
+    font-size: 0.6rem;
+    font-weight: 650;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    border: 1px solid var(--line);
+    cursor: help;
+  }
+
   .when {
     display: flex;
     flex-wrap: wrap;
@@ -220,6 +368,33 @@
 
   .grade { display: flex; align-items: center; gap: 0.2rem; margin-top: 0.75rem; padding-top: 0.7rem; border-top: 1px solid var(--line); }
   .verdict-name { margin-left: 0.35rem; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+
+  /* Both links share the row the Show more button used to have to itself. */
+  .answer-tools { display: flex; align-items: baseline; gap: 0.9rem; }
+
+  .answer-edit textarea {
+    display: block;
+    width: 100%;
+    padding: 0.45rem 0.5rem;
+    font: inherit;
+    font-size: 0.82rem;
+    line-height: 1.6;
+    color: var(--text);
+    background: var(--card);
+    border: 1px solid var(--line);
+    resize: vertical;
+  }
+
+  .answer-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.65rem;
+    margin-top: 0.35rem;
+  }
+
+  /* The shared .link rule adds top margin for its usual standalone use. */
+  .answer-actions .link { margin-top: 0; }
 
   .comment { margin-top: 0.45rem; }
   .comment textarea {
