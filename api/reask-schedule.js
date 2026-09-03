@@ -38,7 +38,7 @@ export function milestoneForRun(publishedAt, runAt) {
   for (const w of windows) {
     if (runInWindow(t, w)) return { id: w.id, label: w.label }
   }
-  if (t < windows[0].start) return { id: 'early', label: '<15mins' }
+  if (t < windows[0].start) return null
   return { id: 'late', label: 'after 1 week' }
 }
 
