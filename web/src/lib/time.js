@@ -36,7 +36,7 @@ export function formatApproxDuration(ms) {
   const abs = Math.abs(ms)
   const minutes = abs / 60000
 
-  if (minutes < 12) return `${sign}<15m`
+  if (minutes < 12) return null
   if (minutes < 50) return `${sign}~${Math.round(minutes / 5) * 5}m`
 
   const hours = abs / 3600000
