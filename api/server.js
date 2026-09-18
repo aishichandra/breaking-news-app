@@ -278,14 +278,16 @@ app.get('/api/articles', async (req, res) => {
   }
 })
 
-// Which of an article's questions are currently flagged "bad question" here
-// -- polled by the pipeline's answer_worker.py right before a re-ask comes
-// due, so flagging a question in this UI actually stops the pipeline from
-// re-asking it, instead of just hiding it from this app's own run-matching.
-// A dedicated route (rather than reusing GET /api/articles) so that check
-// doesn't have to pull every article across the wire for one lookup.
-// GET /api/articles/flags?url=...
-app.get('/api/articles/flags', async (req, res) => {
+// The current server-side truth for one article's questions -- text, ground
+// truth, and whether each is flagged as a bad question -- polled by the
+// pipeline's reask.py right before a re-ask comes due. A flagged question is
+// dropped from the re-ask entirely; an edited question or answer is asked
+// using the edited text, not whatever the pipeline originally generated, so
+// this app stays the source of truth for a story once it's been pushed
+// here. A dedicated route (rather than reusing GET /api/articles) so that
+// check doesn't have to pull every article across the wire for one lookup.
+// GET /api/articles/sync-questions?url=...
+app.get('/api/articles/sync-questions', async (req, res) => {
   try {
     const { url } = req.query
     if (!url) {
@@ -296,14 +298,24 @@ app.get('/api/articles/flags', async (req, res) => {
       .collection('articles')
       .findOne({ url_key: canonicalUrl(url) }, { projection: { questions: 1 } })
 
-    const flagged = (article?.questions ?? [])
-      .filter((q) => q.flagged)
-      .map((q) => q.question)
+    if (!article) {
+      return res.json({ found: false, questions: [] })
+    }
 
-    res.json({ flagged_questions: flagged })
+    const questions = (article.questions ?? [])
+      .slice()
+      .sort((a, b) => (a.question_index ?? 0) - (b.question_index ?? 0))
+      .map((q) => ({
+        question_index: q.question_index,
+        question: q.question,
+        answer: q.answer,
+        flagged: Boolean(q.flagged)
+      }))
+
+    res.json({ found: true, questions })
   } catch (err) {
     console.error(err)
-    res.status(500).json({ error: 'Failed to fetch flags' })
+    res.status(500).json({ error: 'Failed to fetch questions' })
   }
 })
 
@@ -861,10 +873,11 @@ function resolveTarget(req) {
   return { _id: new ObjectId(id), questionIndex }
 }
 
-// Partial update of one question's annotations: the flag, the free-text notes,
-// and the two judgments about whether the question was answerable without the
-// article. Only fields present in the body are touched, so the UI can save one
-// control at a time without clobbering the others.
+// Partial update of one question: its text, its ground-truth answer, the
+// flag, the free-text notes, and the two judgments about whether the
+// question was answerable without the article. Only fields present in the
+// body are touched, so the UI can save one control at a time without
+// clobbering the others.
 // PATCH /api/articles/:id/questions/:index
 app.patch('/api/articles/:id/questions/:index', async (req, res) => {
   try {
@@ -895,6 +908,49 @@ app.patch('/api/articles/:id/questions/:index', async (req, res) => {
           .json({ error: `${field} must be null or one of: ${JUDGMENTS.join(', ')}` })
       }
       $set[`questions.$[q].${field}`] = value
+    }
+
+    // Editing the question text or its ground-truth answer -- distinct from
+    // PATCH /api/answers/:id, which corrects what a *platform* said. The
+    // pipeline's answer_worker.py re-asks using whatever this app currently
+    // has, so an edit here is what actually gets asked going forward, not
+    // just a display change. The first edit stashes the original the same
+    // way a corrected platform answer does, so nothing is silently lost.
+    const editingText = 'question' in body
+    const editingAnswer = 'answer' in body
+
+    if (editingText || editingAnswer) {
+      const doc = await db
+        .collection('articles')
+        .findOne(
+          { _id: target._id, 'questions.question_index': target.questionIndex },
+          { projection: { 'questions.$': 1 } }
+        )
+      const current = doc?.questions?.[0]
+      if (!current) {
+        return res.status(404).json({ error: 'Article or question not found' })
+      }
+
+      if (editingText) {
+        const text = typeof body.question === 'string' ? body.question.trim() : ''
+        if (!text) {
+          return res.status(400).json({ error: 'question must be a non-empty string' })
+        }
+        $set['questions.$[q].question'] = text
+        $set['questions.$[q].question_edited_at'] = new Date()
+        if (current.question_original === undefined) {
+          $set['questions.$[q].question_original'] = current.question
+        }
+      }
+
+      if (editingAnswer) {
+        const text = typeof body.answer === 'string' ? body.answer.trim() : ''
+        $set['questions.$[q].answer'] = text || null
+        $set['questions.$[q].answer_edited_at'] = new Date()
+        if (current.answer_original === undefined) {
+          $set['questions.$[q].answer_original'] = current.answer ?? null
+        }
+      }
     }
 
     if (Object.keys($set).length === 0) {

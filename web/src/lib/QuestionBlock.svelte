@@ -24,7 +24,6 @@
   } = $props()
 
   const questionIndex = $derived(q.question_index ?? index)
-  const terms = $derived(extractKeyTerms(q.answer))
 
   function snapshotRuns(runs) {
     return Object.fromEntries(
@@ -38,6 +37,9 @@
   }
 
   // Local working copies, written through to the server on change.
+  let questionText = $state(untrack(() => q.question))
+  let groundTruth = $state(untrack(() => q.answer ?? ''))
+  const terms = $derived(extractKeyTerms(groundTruth))
   let flagged = $state(untrack(() => q.flagged ?? false))
   let runVerdicts = $state(untrack(() => snapshotRuns(q.runs)))
   const latestRunId = $derived(String(q.runs?.at(-1)?.run_id ?? ''))
@@ -139,6 +141,57 @@
     }
   }
 
+  // Editing the question text and its ground-truth answer together, since
+  // they're conceptually one unit and rarely change independently. Kept
+  // separate from the notes/judgment controls above: those save on every
+  // click, this needs an explicit Save because a wrong question or answer
+  // asked from now on is a bigger consequence than a wrong toggle.
+  let editingQA = $state(false)
+  let questionDraft = $state('')
+  let answerDraft = $state('')
+  let savingQA = $state(false)
+
+  function openEditQA() {
+    questionDraft = questionText
+    answerDraft = groundTruth
+    editingQA = true
+    error = null
+  }
+
+  function cancelEditQA() {
+    editingQA = false
+    error = null
+  }
+
+  async function saveEditQA() {
+    const qText = questionDraft.trim()
+    const aText = answerDraft.trim()
+    if (!qText) {
+      error = 'Question text cannot be empty'
+      return
+    }
+
+    const body = {}
+    if (qText !== questionText) body.question = qText
+    if (aText !== groundTruth) body.answer = aText
+    if (Object.keys(body).length === 0) {
+      editingQA = false
+      return
+    }
+
+    savingQA = true
+    try {
+      await patch(body)
+      questionText = qText
+      groundTruth = aText
+      editingQA = false
+    } catch (err) {
+      error = err.message
+    } finally {
+      savingQA = false
+    }
+  }
+
 </script>
 
 <section class="question" class:flagged class:collapsed>
@@ -152,7 +205,7 @@
       >
         <span class="chevron" aria-hidden="true">{collapsed ? '▸' : '▾'}</span>
         <span class="expander-body">
-          <span class="qtext">{q.question}</span>
+          <span class="qtext">{questionText}</span>
           {#if collapsed && progression.length > 0}
             <span class="progress">
               {#each progression as step, i (step.id)}
@@ -173,8 +226,8 @@
               {/each}
             </span>
           {:else if !collapsed}
-            {#if q.answer}
-              <span class="answer-line"><span class="arrow">→</span><span class="truth">{q.answer}</span></span>
+            {#if groundTruth}
+              <span class="answer-line"><span class="arrow">→</span><span class="truth">{groundTruth}</span></span>
             {:else}
               <span class="answer-line no-answer"><span class="arrow">→</span>no ground-truth answer recorded</span>
             {/if}
@@ -198,6 +251,10 @@
         onclick={() => setJudgment('answerable_from_history', 'yes')}
       >answerable from older reporting</button>
 
+      {#if !collapsed && !editingQA}
+        <button class="link" onclick={openEditQA}>edit question</button>
+      {/if}
+
       {#if flagged}
         <button class="link" onclick={toggleFlag}>unflag</button>
       {:else}
@@ -211,6 +268,21 @@
   {/if}
 
   {#if !collapsed}
+    {#if editingQA}
+      <div class="qa-edit">
+        <span class="label">Question</span>
+        <textarea bind:value={questionDraft} rows="2"></textarea>
+        <span class="label">Ground-truth answer</span>
+        <textarea bind:value={answerDraft} rows="2" placeholder="(none)"></textarea>
+        <div class="qa-edit-actions">
+          <button class="primary" onclick={saveEditQA} disabled={savingQA}>
+            {savingQA ? 'Saving…' : 'Save'}
+          </button>
+          <button class="link" onclick={cancelEditQA}>Cancel</button>
+        </div>
+      </div>
+    {/if}
+
     <QuestionTimeline
       runs={q.runs ?? []}
       {publishedAt}
@@ -387,6 +459,12 @@
   .notes textarea { display: block; width: 100%; padding: 0.5rem 0.6rem; font: inherit; font-size: 0.82rem; border: 1px solid var(--line); background: var(--card); resize: vertical; }
   .primary { margin-top: 0.4rem; padding: 0.35rem 0.8rem; font: inherit; font-size: 0.78rem; background: var(--accent); color: #fff; border: 0; cursor: pointer; }
   .primary:disabled { opacity: 0.45; cursor: default; }
+
+  .qa-edit { margin-top: 0.6rem; padding: 0.75rem; background: var(--card); border: 1px solid var(--line); }
+  .qa-edit .label:not(:first-child) { margin-top: 0.6rem; }
+  .qa-edit textarea { display: block; width: 100%; padding: 0.5rem 0.6rem; font: inherit; font-size: 0.85rem; border: 1px solid var(--line); background: #fff; resize: vertical; }
+  .qa-edit-actions { display: flex; align-items: center; gap: 0.8rem; margin-top: 0.5rem; }
+  .qa-edit-actions .primary { margin-top: 0; }
 
   .err { margin: 0.5rem 0 0; font-size: 0.78rem; color: var(--danger); }
 </style>
