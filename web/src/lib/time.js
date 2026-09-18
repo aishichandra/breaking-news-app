@@ -76,7 +76,6 @@ export function describeLag(publishedAt, askedAt) {
 // COLLECTION_MILESTONES — the fixed publish-relative schedule questions get
 // re-asked on. Keep all three in sync.
 const REASK_MILESTONES = [
-  { id: '15m', label: '15 minutes', ms: 15 * 60000 },
   { id: '30m', label: '30 minutes', ms: 30 * 60000 },
   { id: '1h', label: '1 hour', ms: 3600000 },
   { id: '5h', label: '5 hours', ms: 5 * 3600000 },

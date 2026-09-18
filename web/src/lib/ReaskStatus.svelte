@@ -22,7 +22,7 @@
     re-asks {status.label} mark {status.countdown}
   </span>
 {:else if status?.done}
-  <span class="reask done" title="Every scheduled re-ask (15m/30m/1h/5h/1d after publication) has run">
+  <span class="reask done" title="Every scheduled re-ask (30m/1h/5h/1d after publication) has run">
     re-ask schedule complete
   </span>
 {/if}
