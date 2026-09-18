@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import express from 'express'
 import cors from 'cors'
-import { MongoClient, ObjectId } from 'mongodb'
+import { GridFSBucket, MongoClient, ObjectId } from 'mongodb'
 import { buildQuestions, PLATFORMS } from './normalize.js'
 import { milestoneForRun, runAskedAt } from './reask-schedule.js'
 
@@ -23,6 +23,11 @@ const client = new MongoClient(MONGODB_URI)
 // Overridable so the API can be pointed at a scratch database for end-to-end
 // checks without writing into the live collections.
 const db = client.db(process.env.MONGODB_DB || 'breaking_news')
+// Screenshots (Google AI Overview evidence, see answers.py) live in Mongo
+// via GridFS rather than on disk -- Railway's container filesystem is wiped
+// on every redeploy, and this reuses infrastructure already paid for and
+// configured instead of standing up a separate object store.
+const screenshots = new GridFSBucket(db, { bucketName: 'screenshots' })
 
 // A cluster can be briefly unreachable during a failover or a redeploy.
 // Exiting on the first refusal spends one of the host's restart attempts, and
@@ -451,6 +456,7 @@ app.post('/api/articles', async (req, res) => {
           answer: answer.answer ?? '',
           url: answer.url ?? null,
           citations: answer.citations ?? [],
+          screenshot_id: answer.screenshot_id ?? null,
           verdict: null,
           graded_at: null,
           note: null
@@ -484,7 +490,10 @@ function emptyPlatformAnswer(answer) {
   if (!answer) return true
   const text = typeof answer.answer === 'string' ? answer.answer.trim() : ''
   const cites = answer.citations ?? []
-  return !text && (!Array.isArray(cites) || cites.length === 0) && !answer.url
+  // A screenshot alone still counts as "asked" -- answers.py captures one on
+  // a failed Google run too, specifically so there's something to look at
+  // when the answer text came back empty.
+  return !text && (!Array.isArray(cites) || cites.length === 0) && !answer.url && !answer.screenshot_id
 }
 
 // Matches a batch of scraper entries onto an article's stored questions and
@@ -554,6 +563,7 @@ function resolveRun({ article, platform_answers, runAt, positional = null }) {
         answer: answer.answer ?? '',
         url: answer.url ?? null,
         citations: answer.citations ?? [],
+        screenshot_id: answer.screenshot_id ?? null,
         verdict: null,
         graded_at: null,
         note: null
@@ -1137,6 +1147,63 @@ app.patch('/api/answers/:id', async (req, res) => {
     console.error(err)
     res.status(500).json({ error: 'Failed to save answer' })
   }
+})
+
+// Screenshots (Google AI Overview evidence -- see answers.py) live in
+// GridFS, uploaded once by the pipeline right after capture and referenced
+// from then on by id (answers.screenshot_id) rather than re-sent on every
+// read. POST accepts base64 rather than a raw binary body so it fits the
+// same express.json() middleware everything else here already uses.
+// POST /api/screenshots  { data: "<base64 png>" }
+app.post('/api/screenshots', async (req, res) => {
+  try {
+    const { data } = req.body ?? {}
+    if (typeof data !== 'string' || !data) {
+      return res.status(400).json({ error: 'data (base64-encoded image) is required' })
+    }
+
+    const buffer = Buffer.from(data, 'base64')
+    if (buffer.length === 0) {
+      return res.status(400).json({ error: 'data decoded to an empty file' })
+    }
+
+    const uploadStream = screenshots.openUploadStream('screenshot.png', {
+      contentType: 'image/png'
+    })
+
+    uploadStream.on('finish', () => {
+      res.status(201).json({ ok: true, id: uploadStream.id.toString() })
+    })
+    uploadStream.on('error', (err) => {
+      console.error(err)
+      if (!res.headersSent) res.status(500).json({ error: 'Failed to store screenshot' })
+    })
+
+    uploadStream.end(buffer)
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to store screenshot' })
+  }
+})
+
+// Streams the PNG back so the UI can use this directly as an <img src>.
+// GET /api/screenshots/:id
+app.get('/api/screenshots/:id', (req, res) => {
+  const { id } = req.params
+  if (!ObjectId.isValid(id)) {
+    return res.status(400).json({ error: 'Not a valid screenshot id' })
+  }
+
+  const downloadStream = screenshots.openDownloadStream(new ObjectId(id))
+  downloadStream.on('file', (file) => {
+    res.set('Content-Type', file.contentType || 'image/png')
+    // Content-addressed by id -- an id's bytes never change once uploaded.
+    res.set('Cache-Control', 'private, max-age=31536000, immutable')
+  })
+  downloadStream.on('error', () => {
+    if (!res.headersSent) res.status(404).json({ error: 'Screenshot not found' })
+  })
+  downloadStream.pipe(res)
 })
 
 // Manually records one platform's answer for a question that has none yet in

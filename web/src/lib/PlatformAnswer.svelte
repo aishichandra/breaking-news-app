@@ -34,6 +34,12 @@
 
 
   const citations = $derived(effectiveResult?.citations ?? [])
+  // Google only -- a screenshot of the AI Overview page at the moment it was
+  // captured (or the failure happened), evidence for verifying the
+  // extraction or diagnosing a miss without reproducing the search live.
+  const screenshotUrl = $derived(
+    effectiveResult?.screenshot_id ? `${API}/api/screenshots/${effectiveResult.screenshot_id}` : null
+  )
 
   // The answer text is held locally rather than read straight off the prop,
   // because a correction has to stay on screen after it is saved — the parent
@@ -326,6 +332,13 @@
       </div>
     {/if}
 
+    {#if screenshotUrl}
+      <a class="screenshot-link" href={screenshotUrl} target="_blank" rel="noreferrer">
+        <img class="screenshot-thumb" src={screenshotUrl} alt="Screenshot of the Google AI Overview page for this run" loading="lazy" />
+        <span class="link">View full screenshot ↗</span>
+      </a>
+    {/if}
+
     <div class="cites">
       {#if citations.length > 0}
         <div class="table-wrap">
@@ -485,6 +498,17 @@
 
   /* Both links share the row the Show more button used to have to itself. */
   .answer-tools { display: flex; align-items: baseline; gap: 0.9rem; }
+
+  .screenshot-link {
+    display: flex; align-items: center; gap: 0.5rem; margin-top: 0.6rem;
+    text-decoration: none; color: inherit; width: fit-content;
+  }
+  .screenshot-thumb {
+    width: 3.2rem; height: 2.1rem; object-fit: cover; object-position: top;
+    border: 1px solid var(--line); background: var(--card);
+  }
+  .screenshot-link .link { pointer-events: none; }
+  .screenshot-link:hover .link { text-decoration: underline; }
 
   .answer-edit textarea {
     display: block;

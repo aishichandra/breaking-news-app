@@ -28,7 +28,11 @@ function normalizePlatform(raw, fallbackStamp) {
       label: c.label ?? '',
       url: c.url ?? null,
       trust: c.trust ?? null
-    }))
+    })),
+    // Google only, and only when answers.py managed to capture one --
+    // GridFS id of the AI Overview page screenshot, uploaded by the
+    // pipeline via POST /api/screenshots before this payload is sent.
+    screenshot_id: raw.screenshot_id ?? null
   }
 }
 
