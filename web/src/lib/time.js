@@ -72,6 +72,45 @@ export function describeLag(publishedAt, askedAt) {
   }
 }
 
+// Matches answer_worker.py's REASK_OFFSETS / api/reask-schedule.js's
+// COLLECTION_MILESTONES — the fixed publish-relative schedule questions get
+// re-asked on. Keep all three in sync.
+const REASK_MILESTONES = [
+  { id: '15m', label: '15 minutes', ms: 15 * 60000 },
+  { id: '30m', label: '30 minutes', ms: 30 * 60000 },
+  { id: '1h', label: '1 hour', ms: 3600000 },
+  { id: '5h', label: '5 hours', ms: 5 * 3600000 },
+  { id: '1d', label: '1 day', ms: 86400000 }
+]
+
+// Where a story sits in the re-ask schedule: what's still coming, and when.
+// Reads the schedule off the *last* milestone actually reached (from the
+// most recent run's server-computed `milestone.id`) rather than counting
+// runs, so it stays correct even if a run was skipped after a failure or a
+// manual update landed out of band. `now` is injected so a live countdown
+// can re-derive this on a timer without this function reading the clock
+// itself. Returns null when there's no publish date to schedule against.
+export function nextReask(publishedAt, runs = [], now = Date.now()) {
+  const pub = toDate(publishedAt)
+  if (!pub) return null
+
+  const lastMilestoneId = runs.length > 0 ? runs.at(-1)?.milestone?.id ?? null : null
+  const lastIndex = REASK_MILESTONES.findIndex((m) => m.id === lastMilestoneId)
+  const next = REASK_MILESTONES[lastIndex + 1]
+  if (!next) return { done: true }
+
+  const dueAt = pub.getTime() + next.ms
+  const msUntil = dueAt - now
+
+  return {
+    done: false,
+    label: next.label,
+    dueAt: new Date(dueAt).toISOString(),
+    overdue: msUntil <= 0,
+    countdown: msUntil <= 0 ? 'due now' : `in ${formatDuration(msUntil)}`
+  }
+}
+
 export function domainOf(url) {
   try {
     return new URL(url).hostname.replace(/^www\./, '')

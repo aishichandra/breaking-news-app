@@ -1,8 +1,13 @@
+const MINUTE = 60000
 const HOUR = 3600000
 const DAY = 24 * HOUR
 
-// Publish-relative intervals for labeling timeline entries.
+// Publish-relative intervals for labeling timeline entries. Matches the
+// pipeline's answer_worker.py REASK_OFFSETS (15m/30m/1h/5h/1d) plus a
+// trailing 1w bucket for anything asked later than that.
 export const COLLECTION_MILESTONES = [
+  { id: '15m', label: '15 minutes', ms: 15 * MINUTE },
+  { id: '30m', label: '30 minutes', ms: 30 * MINUTE },
   { id: '1h', label: '1 hour', ms: 1 * HOUR },
   { id: '5h', label: '5 hours', ms: 5 * HOUR },
   { id: '1d', label: '1 day', ms: 1 * DAY },

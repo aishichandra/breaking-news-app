@@ -3,7 +3,13 @@
   import { API } from './api.js'
   import QuestionTimeline from './QuestionTimeline.svelte'
   import { extractKeyTerms } from './highlight.js'
-  import { PLATFORM_NAMES, PLATFORM_LABELS, SYMBOL } from './verdicts.js'
+  import { PLATFORM_NAMES, PLATFORM_GROUPS, PLATFORM_LABELS, SYMBOL } from './verdicts.js'
+
+  // The collapsed summary stays a quick glance regardless of whether the API
+  // columns are toggled on elsewhere — it's the live-interface platforms
+  // that answer "how did the real products do", so that's what a compact
+  // row of chips should show. The full breakdown is one click away.
+  const SUMMARY_PLATFORMS = PLATFORM_GROUPS.find((g) => g.id === 'interface').names
   import { formatApproxDuration, toDate } from './time.js'
 
   let {
@@ -40,7 +46,7 @@
     (q.runs ?? []).map((run, i) => {
       const id = String(run.run_id)
       const marks = runVerdicts[id] ?? {}
-      const names = PLATFORM_NAMES.filter((n) => run.platforms?.[n]?.answer)
+      const names = SUMMARY_PLATFORMS.filter((n) => run.platforms?.[n]?.answer)
       const pub = toDate(publishedAt)
       const asked = toDate(run.asked_at)
       const lagMs = pub && asked ? asked - pub : null

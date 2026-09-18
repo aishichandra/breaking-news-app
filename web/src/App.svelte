@@ -2,6 +2,7 @@
   import { API } from './lib/api.js'
   import ArticleCard from './lib/ArticleCard.svelte'
   import NewArticleForm from './lib/NewArticleForm.svelte'
+  import { platformView, toggleShowApi } from './lib/platformView.svelte.js'
 
   let tab = $state('view')
 
@@ -52,6 +53,10 @@
       <button class:active={tab === 'add'} onclick={() => (tab = 'add')}>
         Add data
       </button>
+      <label class="api-switch" title="The 6 raw-API columns, off by default to keep the page from feeling overwhelming">
+        <input type="checkbox" checked={platformView.showApi} onchange={toggleShowApi} />
+        Show API answers
+      </label>
       <a class="export" href="{API}/api/export.json">Export JSON</a>
     </nav>
   </div>
@@ -171,6 +176,19 @@
     border: 0;
     cursor: pointer;
   }
+
+  .api-switch {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin-left: 0.5rem;
+    font-size: 0.78rem;
+    color: var(--muted);
+    cursor: pointer;
+    user-select: none;
+  }
+  .api-switch:hover { color: var(--text); }
+  .api-switch input { accent-color: var(--accent); cursor: pointer; }
 
   .export {
     align-self: center;

@@ -1,4 +1,13 @@
-export const PLATFORMS = ['google', 'chatgpt', 'claude', 'perplexity']
+// The four consumer-interface platforms (live browser grabs), plus the raw
+// API-step matrix pushed alongside them -- gpt-4o/claude-sonnet-4 each with
+// and without a web-search tool, Perplexity's API, and SerpAPI's AI
+// Overview. Keep in sync with answer_worker.py's APP_PLATFORMS/API_PLATFORMS.
+export const PLATFORMS = [
+  'google', 'chatgpt', 'claude', 'perplexity',
+  'gpt4o-no-search', 'gpt4o-web-search',
+  'claude-sonnet4-no-search', 'claude-sonnet4-web-search',
+  'perplexity-api', 'google-ai-overview-api'
+]
 
 // Your scraper emits `sources` for Google and `citations` for everyone else.
 // Same concept, two names — collapse them here so nothing downstream has to care.

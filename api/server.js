@@ -4,7 +4,7 @@ import { createHash, timingSafeEqual } from 'node:crypto'
 import express from 'express'
 import cors from 'cors'
 import { MongoClient, ObjectId } from 'mongodb'
-import { buildQuestions } from './normalize.js'
+import { buildQuestions, PLATFORMS } from './normalize.js'
 import { milestoneForRun, runAskedAt } from './reask-schedule.js'
 
 const MONGODB_URI = process.env.MONGODB_URI
@@ -278,6 +278,35 @@ app.get('/api/articles', async (req, res) => {
   }
 })
 
+// Which of an article's questions are currently flagged "bad question" here
+// -- polled by the pipeline's answer_worker.py right before a re-ask comes
+// due, so flagging a question in this UI actually stops the pipeline from
+// re-asking it, instead of just hiding it from this app's own run-matching.
+// A dedicated route (rather than reusing GET /api/articles) so that check
+// doesn't have to pull every article across the wire for one lookup.
+// GET /api/articles/flags?url=...
+app.get('/api/articles/flags', async (req, res) => {
+  try {
+    const { url } = req.query
+    if (!url) {
+      return res.status(400).json({ error: 'url is required' })
+    }
+
+    const article = await db
+      .collection('articles')
+      .findOne({ url_key: canonicalUrl(url) }, { projection: { questions: 1 } })
+
+    const flagged = (article?.questions ?? [])
+      .filter((q) => q.flagged)
+      .map((q) => q.question)
+
+    res.json({ flagged_questions: flagged })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to fetch flags' })
+  }
+})
+
 // Same payload every time: url + ground truth + platform_answers, indexed the
 // way your scraper already emits them. A URL we've seen before records another
 // run against the existing question_ids instead of creating a duplicate.
@@ -287,7 +316,7 @@ function questionKey(text) {
 
 app.post('/api/articles', async (req, res) => {
   try {
-    const { url, published_at, updated_at, snippet, markdown, questions, platform_answers } =
+    const { url, published_at, updated_at, snippet, markdown, exclusive, questions, platform_answers } =
       req.body
 
     if (!url) {
@@ -316,6 +345,12 @@ app.post('/api/articles', async (req, res) => {
         // record of what the platforms could actually have been reading.
         markdown: typeof markdown === 'string' && markdown.trim() ? markdown.trim() : null,
         markdown_at: typeof markdown === 'string' && markdown.trim() ? new Date() : null,
+        // An outlet either has a story alone or it doesn't — unlike the
+        // free-text fields above, there's no "unknown yet" to preserve, so
+        // this is the one field here safe to set outright on creation
+        // rather than only filling in when missing.
+        exclusive: typeof exclusive === 'boolean' ? exclusive : false,
+        exclusive_at: exclusive ? new Date() : null,
         questions: built.map((q) => ({
           question_id: new ObjectId(),
           question_index: q.question_index,
@@ -1045,6 +1080,88 @@ app.patch('/api/answers/:id', async (req, res) => {
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Failed to save answer' })
+  }
+})
+
+// Manually records one platform's answer for a question that has none yet in
+// a given run -- the platform genuinely wasn't recorded (a failed scrape, a
+// timeout) so there's no existing document to correct with PATCH
+// /api/answers/:id, only a gap to fill by hand. Marked `manual: true` so the
+// export can tell a hand-entered answer apart from a scrape, the same way
+// `answer_original` marks a corrected one.
+// POST /api/articles/:id/questions/:index/answers
+//   { run_id, platform, answer, url?, citations? }
+app.post('/api/articles/:id/questions/:index/answers', async (req, res) => {
+  try {
+    const target = resolveTarget(req)
+    if (target.error) return res.status(400).json({ error: target.error })
+
+    const { run_id, platform, answer, url, citations } = req.body ?? {}
+
+    if (!PLATFORMS.includes(platform)) {
+      return res.status(400).json({ error: `platform must be one of: ${PLATFORMS.join(', ')}` })
+    }
+    if (!ObjectId.isValid(run_id)) {
+      return res.status(400).json({ error: 'run_id is not valid' })
+    }
+    const text = typeof answer === 'string' ? answer.trim() : ''
+    if (!text) {
+      return res.status(400).json({ error: 'answer must be a non-empty string' })
+    }
+
+    const article = await db
+      .collection('articles')
+      .findOne({ _id: target._id, 'questions.question_index': target.questionIndex })
+    if (!article) {
+      return res.status(404).json({ error: 'Article or question not found' })
+    }
+    const question = article.questions.find((q) => q.question_index === target.questionIndex)
+
+    // The run has to already exist -- found via any other platform's document
+    // in it -- so a client can't invent a stray run_id that never came from
+    // an actual collection pass. Its run_at rides along so the new document
+    // sits in the same timeline slot as its sibling platforms.
+    const runDoc = await db.collection('answers').findOne({
+      question_id: question.question_id,
+      run_id: new ObjectId(run_id)
+    })
+    if (!runDoc) {
+      return res.status(404).json({ error: 'That run does not exist for this question' })
+    }
+
+    const clash = await db.collection('answers').findOne({
+      question_id: question.question_id,
+      run_id: new ObjectId(run_id),
+      platform
+    })
+    if (clash) {
+      return res.status(409).json({
+        error: `${platform} already has an answer in this run — edit it instead of adding a new one`
+      })
+    }
+
+    const doc = {
+      article_id: target._id,
+      question_id: question.question_id,
+      platform,
+      run_id: new ObjectId(run_id),
+      run_at: runDoc.run_at,
+      asked_at: null,
+      answer: text,
+      url: typeof url === 'string' && url.trim() ? url.trim() : null,
+      citations: Array.isArray(citations) ? citations : [],
+      verdict: null,
+      graded_at: null,
+      note: null,
+      manual: true,
+      added_at: new Date()
+    }
+
+    const inserted = await db.collection('answers').insertOne(doc)
+    res.status(201).json({ ...doc, _id: inserted.insertedId })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to add answer' })
   }
 })
 

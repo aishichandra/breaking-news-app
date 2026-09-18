@@ -1,6 +1,7 @@
 <script>
   import { API } from './api.js'
   import QuestionBlock from './QuestionBlock.svelte'
+  import ReaskStatus from './ReaskStatus.svelte'
   import { untrack } from 'svelte'
   import { parseArrayField } from './parseData.js'
   import { formatDateTime, toLocalInputValue } from './time.js'
@@ -100,6 +101,9 @@
   }
 
   const questionCount = $derived(article.questions?.length ?? 0)
+  // Every question in an article is asked together in one batch, so the
+  // first question's run history stands in for the whole story's schedule.
+  const scheduleRuns = $derived(article.questions?.[0]?.runs ?? [])
 
   async function handleDelete() {
     const ok = confirm(
@@ -307,6 +311,11 @@
               editingUpdatedDate = true
             }}
           >{updated ? `Updated ${updated}` : 'add updated date'}</button>
+        {/if}
+
+        {#if publishedAt}
+          <span class="sep">&middot;</span>
+          <ReaskStatus {publishedAt} runs={scheduleRuns} />
         {/if}
       </p>
 

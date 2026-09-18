@@ -4,7 +4,7 @@
   import CitationRow from './CitationRow.svelte'
   import { highlightSegments } from './highlight.js'
   import { describeLag, formatDateTime } from './time.js'
-  import { PLATFORM_LABELS as LABELS, VERDICTS } from './verdicts.js'
+  import { PLATFORM_LABELS as LABELS, GROUP_OF, VERDICTS } from './verdicts.js'
 
   let {
     name,
@@ -12,33 +12,44 @@
     publishedAt = null,
     articleId,
     questionIndex,
+    runId = null,
     onGraded = () => {},
     onCitationSaved = () => {},
+    onAnswerAdded = () => {},
     terms = null
   } = $props()
 
-  const askedAt = $derived(result?.asked_at ?? null)
+  const group = $derived(GROUP_OF[name] ?? 'interface')
+
+  // A platform with no recorded answer has no `result` at all -- once one is
+  // added by hand (below), it's held here rather than waiting on the parent
+  // to refetch, the same reasoning as `answerText` below.
+  let addedResult = $state(null)
+  const effectiveResult = $derived(result ?? addedResult)
+
+  const askedAt = $derived(effectiveResult?.asked_at ?? null)
   const lag = $derived(
     publishedAt && askedAt ? describeLag(publishedAt, askedAt) : null
   )
 
 
-  const citations = $derived(result?.citations ?? [])
+  const citations = $derived(effectiveResult?.citations ?? [])
 
   // The answer text is held locally rather than read straight off the prop,
   // because a correction has to stay on screen after it is saved — the parent
   // only refetches on its own schedule.
-  let answerText = $state(untrack(() => result?.answer ?? ''))
-  let originalAnswer = $state(untrack(() => result?.answer_original ?? null))
-  let editedAt = $state(untrack(() => result?.answer_edited_at ?? null))
+  let answerText = $state(untrack(() => effectiveResult?.answer ?? ''))
+  let originalAnswer = $state(untrack(() => effectiveResult?.answer_original ?? null))
+  let editedAt = $state(untrack(() => effectiveResult?.answer_edited_at ?? null))
+  let manuallyAdded = $state(untrack(() => Boolean(effectiveResult?.manual)))
 
   const segments = $derived(highlightSegments(answerText, terms))
   const isLong = $derived(answerText.length > 420)
 
   let expanded = $state(false)
-  let verdict = $state(untrack(() => result?.verdict ?? null))
-  let note = $state(untrack(() => result?.note ?? ''))
-  let savedNote = $state(untrack(() => result?.note ?? ''))
+  let verdict = $state(untrack(() => effectiveResult?.verdict ?? null))
+  let note = $state(untrack(() => effectiveResult?.note ?? ''))
+  let savedNote = $state(untrack(() => effectiveResult?.note ?? ''))
   let savingNote = $state(false)
   let saveError = $state(null)
   let commenting = $state(false)
@@ -46,6 +57,11 @@
   let editingAnswer = $state(false)
   let draftAnswer = $state('')
   let savingAnswer = $state(false)
+
+  let addingAnswer = $state(false)
+  let newAnswerDraft = $state('')
+  let savingNewAnswer = $state(false)
+  let addError = $state(null)
 
   // Only worth offering when there is something to go back to: an edit made to
   // fill in a blank scrape has nothing useful to restore.
@@ -73,7 +89,7 @@
   })
 
   async function patchAnswer(body) {
-    const res = await fetch(`${API}/api/answers/${result._id}`, {
+    const res = await fetch(`${API}/api/answers/${effectiveResult._id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
@@ -163,6 +179,61 @@
     }
   }
 
+  function openAddAnswer() {
+    newAnswerDraft = ''
+    addingAnswer = true
+    addError = null
+  }
+
+  function cancelAddAnswer() {
+    addingAnswer = false
+    addError = null
+  }
+
+  // Unlike saveAnswer() above, there's no existing document to PATCH -- this
+  // platform was never recorded for this run at all, so the server inserts a
+  // fresh one. Held in addedResult afterward so the rest of the component
+  // (grading, notes, further edits) treats it exactly like a scraped result.
+  async function saveNewAnswer() {
+    const text = newAnswerDraft.trim()
+    if (!text) return
+
+    savingNewAnswer = true
+    addError = null
+
+    try {
+      const res = await fetch(`${API}/api/articles/${articleId}/questions/${questionIndex}/answers`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ run_id: runId, platform: name, answer: text })
+      })
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}))
+        throw new Error(detail.error ?? `API returned ${res.status}`)
+      }
+      const saved = await res.json()
+      addedResult = saved
+      answerText = saved.answer ?? text
+      manuallyAdded = true
+      addingAnswer = false
+      onAnswerAdded()
+    } catch (err) {
+      addError = err.message
+    } finally {
+      savingNewAnswer = false
+    }
+  }
+
+  function handleNewAnswerKey(event) {
+    if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault()
+      if (!savingNewAnswer) saveNewAnswer()
+    } else if (event.key === 'Escape') {
+      event.preventDefault()
+      cancelAddAnswer()
+    }
+  }
+
   // Puts the caret at the end rather than at character zero: a truncated answer
   // is fixed at the bottom, which is also where the textarea should be sitting.
   function focusOnOpen(node) {
@@ -181,21 +252,27 @@
   }
 </script>
 
-<div class="platform" data-verdict={verdict}>
+<div class="platform" data-verdict={verdict} data-group={group}>
   <div class="head">
     <span class="name">{LABELS[name] ?? name}</span>
-    {#if editedAt}
+    <span class="group-badge {group}" title={group === 'api' ? 'Called the model/search API directly' : 'Asked by driving the real consumer product in a browser'}>{group === 'api' ? 'API' : 'LIVE'}</span>
+    {#if manuallyAdded}
+      <span
+        class="edited"
+        title="Entered by hand — the pipeline never recorded an answer from this platform for this run"
+      >added by hand</span>
+    {:else if editedAt}
       <span
         class="edited"
         title="Answer corrected by hand on {formatDateTime(editedAt)} — the scraped text is kept as answer_original in the export"
       >edited</span>
     {/if}
-    {#if result?.url}
-      <a class="session" href={result.url} target="_blank" rel="noreferrer">↗</a>
+    {#if effectiveResult?.url}
+      <a class="session" href={effectiveResult.url} target="_blank" rel="noreferrer">↗</a>
     {/if}
   </div>
 
-  {#if result}
+  {#if effectiveResult}
     {#if saveError}<p class="save-error">{saveError}</p>{/if}
 
     {#if lag}
@@ -309,8 +386,28 @@
       <button type="button" class="link comment-toggle" onclick={startComment}>add comment</button>
     {/if}
 
+  {:else if addingAnswer}
+    {#if addError}<p class="save-error">{addError}</p>{/if}
+    <div class="answer-edit">
+      <textarea
+        bind:value={newAnswerDraft}
+        rows="8"
+        onkeydown={handleNewAnswerKey}
+        use:focusOnOpen
+        placeholder="What the platform actually said…"
+      ></textarea>
+      <div class="answer-actions">
+        <button type="button" class="save-note" onclick={saveNewAnswer} disabled={savingNewAnswer || !newAnswerDraft.trim()}>
+          {savingNewAnswer ? 'Saving…' : 'Save answer'}
+        </button>
+        <button type="button" class="link" onclick={cancelAddAnswer}>Cancel</button>
+      </div>
+    </div>
   {:else}
     <p class="none">No answer recorded</p>
+    {#if runId}
+      <button type="button" class="link" onclick={openAddAnswer}>add answer</button>
+    {/if}
   {/if}
 </div>
 
@@ -340,6 +437,23 @@
   }
 
   .session { font-size: 0.75rem; color: var(--muted); text-decoration: none; }
+
+  /* Provenance, not status — deliberately quieter than the verdict colors so
+     it reads at a glance without competing with them. */
+  .group-badge {
+    padding: 0.05rem 0.3rem;
+    font-size: 0.56rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    border-radius: 2px;
+  }
+  .group-badge.interface { color: #1a6b4a; background: #e3f3ea; }
+  .group-badge.api { color: #2a548f; background: #e5eef9; }
+
+  /* A faint left rail on the whole card, matching the section-level accent
+     in QuestionTimeline, so an API card still reads as "API" even scrolled
+     out of its group header's view. */
+  .platform[data-group='api'] { border-left: 2px solid #dbe6f5; }
 
   /* Sits with the platform name; the auto margin keeps the session link on the
      far right rather than letting three items space themselves evenly. */
