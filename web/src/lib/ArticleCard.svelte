@@ -313,10 +313,14 @@
           >{updated ? `Updated ${updated}` : 'add updated date'}</button>
         {/if}
 
-        {#if publishedAt}
-          <span class="sep">&middot;</span>
-          <ReaskStatus {publishedAt} runs={scheduleRuns} />
-        {/if}
+        <span class="sep">&middot;</span>
+        <ReaskStatus
+          articleId={article._id}
+          {publishedAt}
+          runs={scheduleRuns}
+          queued={article.reask_queued}
+          onChange={onUpdated}
+        />
       </p>
 
       {#if editingSnippet}

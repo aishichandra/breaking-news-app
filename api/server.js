@@ -59,7 +59,11 @@ async function ensureIndexes() {
     ['articles', { url_key: 1 }, { unique: true }],
     ['answers', { question_id: 1, run_at: -1 }, {}],
     ['answers', { article_id: 1, question_id: 1, platform: 1, run_at: -1 }, {}],
-    ['sources', { url: 1, method: 1 }, {}]
+    ['sources', { url: 1, method: 1 }, {}],
+    // One queued re-ask per article: a second click while one is waiting
+    // is the same request, not a second run. Unique at the database level
+    // so two near-simultaneous clicks can't both get in.
+    ['reask_queue', { article_id: 1 }, { unique: true }]
   ]
 
   for (const [collection, key, options] of wanted) {
@@ -219,6 +223,19 @@ async function attachSourceDates(articles) {
   return articles
 }
 
+// Which articles are waiting on a manually-triggered re-ask (see the
+// /reask routes below), and where in line -- position 1 is next. The queue is
+// tiny (a handful of entries at most), so one read per page load is fine.
+async function attachReaskQueue(articles) {
+  const queued = await db.collection('reask_queue').find({}).sort({ requested_at: 1 }).toArray()
+  const byArticle = new Map(queued.map((entry, i) => [String(entry.article_id), { requested_at: entry.requested_at, position: i + 1 }]))
+
+  for (const article of articles) {
+    article.reask_queued = byArticle.get(String(article._id)) ?? null
+  }
+  return articles
+}
+
 const app = express()
 app.use(cors())
 app.use(express.json({ limit: '5mb' }))
@@ -276,51 +293,10 @@ app.get('/api/articles', async (req, res) => {
       ])
       .toArray()
 
-    res.json(await attachSourceDates(await attachAnswers(articles)))
+    res.json(await attachReaskQueue(await attachSourceDates(await attachAnswers(articles))))
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Failed to fetch articles' })
-  }
-})
-
-// The current server-side truth for one article's questions -- text, ground
-// truth, and whether each is flagged as a bad question -- polled by the
-// pipeline's reask.py right before a re-ask comes due. A flagged question is
-// dropped from the re-ask entirely; an edited question or answer is asked
-// using the edited text, not whatever the pipeline originally generated, so
-// this app stays the source of truth for a story once it's been pushed
-// here. A dedicated route (rather than reusing GET /api/articles) so that
-// check doesn't have to pull every article across the wire for one lookup.
-// GET /api/articles/sync-questions?url=...
-app.get('/api/articles/sync-questions', async (req, res) => {
-  try {
-    const { url } = req.query
-    if (!url) {
-      return res.status(400).json({ error: 'url is required' })
-    }
-
-    const article = await db
-      .collection('articles')
-      .findOne({ url_key: canonicalUrl(url) }, { projection: { questions: 1 } })
-
-    if (!article) {
-      return res.json({ found: false, questions: [] })
-    }
-
-    const questions = (article.questions ?? [])
-      .slice()
-      .sort((a, b) => (a.question_index ?? 0) - (b.question_index ?? 0))
-      .map((q) => ({
-        question_index: q.question_index,
-        question: q.question,
-        answer: q.answer,
-        flagged: Boolean(q.flagged)
-      }))
-
-    res.json({ found: true, questions })
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ error: 'Failed to fetch questions' })
   }
 })
 
@@ -856,11 +832,136 @@ app.delete('/api/articles/:id', async (req, res) => {
     // Answers live in their own collection now, so they don't go with the
     // article automatically. Leaving them behind orphans every run.
     await db.collection('answers').deleteMany({ article_id: new ObjectId(id) })
+    await db.collection('reask_queue').deleteMany({ article_id: new ObjectId(id) })
 
     res.status(204).end()
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Failed to delete article' })
+  }
+})
+
+// Manual re-ask queue. The pipeline no longer re-asks a story's questions on
+// its own schedule -- it alerts (Slack) when a 30m/1h/5h/1d mark comes due,
+// and a re-ask only happens when someone asks for one here. Each entry is one
+// article waiting to have its unflagged questions put to the four platforms
+// again; the pipeline's answer worker polls GET /api/reask-queue, works
+// through it oldest first, and DELETEs each entry once the fresh answers are
+// recorded -- so an entry existing means "still waiting," and a worker that
+// dies mid-re-ask simply finds the same entry on its next poll.
+// POST /api/articles/:id/reask
+app.post('/api/articles/:id/reask', async (req, res) => {
+  try {
+    const { id } = req.params
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: 'Not a valid article id' })
+    }
+
+    const article = await db
+      .collection('articles')
+      .findOne({ _id: new ObjectId(id) }, { projection: { questions: 1 } })
+    if (!article) {
+      return res.status(404).json({ error: 'Article not found' })
+    }
+    if (!(article.questions ?? []).some((q) => !q.flagged)) {
+      return res.status(400).json({ error: 'Every question on this article is flagged, so there is nothing to re-ask' })
+    }
+
+    // Upsert on article_id: a second click while one is waiting leaves the
+    // original entry (and its place in line) alone. The unique index turns a
+    // simultaneous double-click into a duplicate-key error rather than two
+    // entries, which is the same outcome.
+    let alreadyQueued = false
+    try {
+      const result = await db
+        .collection('reask_queue')
+        .updateOne(
+          { article_id: article._id },
+          { $setOnInsert: { article_id: article._id, requested_at: new Date() } },
+          { upsert: true }
+        )
+      alreadyQueued = result.upsertedCount === 0
+    } catch (err) {
+      if (err.code !== 11000) throw err
+      alreadyQueued = true
+    }
+
+    res.status(alreadyQueued ? 200 : 201).json({ queued: true, already_queued: alreadyQueued })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to queue re-ask' })
+  }
+})
+
+// Removes an article's queued re-ask -- both "cancel" from the UI and
+// "done" from the worker. The worker passes the requested_at it was handed,
+// so if the entry was cancelled and queued again while its run was in flight
+// (say, after editing a question, which that run wouldn't have picked up),
+// the newer request survives instead of being swallowed by the older run.
+// DELETE /api/articles/:id/reask[?requested_at=<iso>]
+app.delete('/api/articles/:id/reask', async (req, res) => {
+  try {
+    const { id } = req.params
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: 'Not a valid article id' })
+    }
+
+    const filter = { article_id: new ObjectId(id) }
+    if (req.query.requested_at) {
+      const requestedAt = new Date(req.query.requested_at)
+      if (Number.isNaN(requestedAt.getTime())) {
+        return res.status(400).json({ error: 'requested_at is not a valid date' })
+      }
+      filter.requested_at = requestedAt
+    }
+
+    const { deletedCount } = await db.collection('reask_queue').deleteOne(filter)
+    res.json({ removed: deletedCount > 0 })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to cancel re-ask' })
+  }
+})
+
+// What the answer worker needs to run the queue: oldest request first, each
+// with the article's URL and its current unflagged questions -- the same
+// text and ground truth shown (and possibly edited) in this UI, so an edit
+// made here is what actually gets asked. The article's markdown is left out
+// on purpose: nothing about asking uses it, and it is the bulky field.
+// GET /api/reask-queue
+app.get('/api/reask-queue', async (req, res) => {
+  try {
+    const entries = await db
+      .collection('reask_queue')
+      .aggregate([
+        { $sort: { requested_at: 1 } },
+        { $lookup: { from: 'articles', localField: 'article_id', foreignField: '_id', as: 'article' } },
+        { $project: { requested_at: 1, article_id: 1, 'article.url': 1, 'article.published_at': 1, 'article.exclusive': 1, 'article.questions': 1 } }
+      ])
+      .toArray()
+
+    res.json({
+      items: entries.map((entry) => {
+        const article = entry.article[0]
+        return {
+          article_id: entry.article_id,
+          requested_at: entry.requested_at,
+          // Null when the article was deleted after this was queued (the
+          // DELETE route above also clears its entries, but a direct database
+          // edit wouldn't) -- the worker completes such an entry as a no-op.
+          url: article?.url ?? null,
+          published_at: article?.published_at ?? null,
+          exclusive: article?.exclusive ?? false,
+          questions: (article?.questions ?? [])
+            .filter((q) => !q.flagged)
+            .sort((a, b) => (a.question_index ?? 0) - (b.question_index ?? 0))
+            .map((q) => ({ question_index: q.question_index, question: q.question, answer: q.answer }))
+        }
+      })
+    })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to fetch re-ask queue' })
   }
 })
 

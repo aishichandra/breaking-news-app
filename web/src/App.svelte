@@ -36,6 +36,17 @@
 
   refresh()
 
+  // A queued re-ask finishes on the answer worker's schedule, not the
+  // page's, so while any are waiting the list quietly re-fetches until the
+  // queued state clears and the fresh answers show up. Stops on its own once
+  // nothing is queued -- an idle page makes no background requests.
+  const anyQueued = $derived(articles.some((a) => a.reask_queued))
+  $effect(() => {
+    if (!anyQueued) return
+    const id = setInterval(refresh, 15000)
+    return () => clearInterval(id)
+  })
+
   function handleCreated() {
     refresh()
     tab = 'view'
