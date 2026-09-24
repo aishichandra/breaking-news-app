@@ -9,6 +9,8 @@
 
   let {
     name,
+    displayName = null,
+    comparison = false,
     result,
     publishedAt = null,
     articleId,
@@ -314,9 +316,9 @@
   {/if}
 {/snippet}
 
-<div class="platform" data-verdict={verdict} data-group={group}>
+<div class="platform" class:comparison data-verdict={verdict} data-group={group}>
   <div class="head">
-    <span class="name">{LABELS[name] ?? name}</span>
+    <span class="name">{displayName ?? LABELS[name] ?? name}</span>
     <span class="group-badge {group}" title={group === 'api' ? 'Called the model/search API directly' : 'Asked by driving the real consumer product in a browser'}>{group === 'api' ? 'API' : 'LIVE'}</span>
     {#if manuallyAdded}
       <span
@@ -424,6 +426,8 @@
           class="verdict {v.value}"
           class:on={verdict === v.value}
           data-tip={v.title}
+          aria-label={v.title}
+          aria-pressed={verdict === v.value}
           onclick={() => setVerdict(v.value)}
         >{v.symbol}</button>
       {/each}
@@ -491,11 +495,11 @@
     border: 1px solid var(--line);
   }
 
-  .platform[data-verdict='correct']     { background: #f7fbf8; }
-  .platform[data-verdict='incorrect']   { background: #fdf7f7; }
-  .platform[data-verdict='partial']     { background: #fffdf5; }
-  .platform[data-verdict='abstained']   { background: #fafafa; }
-  .platform[data-verdict='speculation'] { background: #faf8fd; }
+  .platform[data-verdict='correct']     { background: #edf7ef; }
+  .platform[data-verdict='incorrect']   { background: #fceeee; }
+  .platform[data-verdict='partial']     { background: #fff8df; }
+  .platform[data-verdict='abstained']   { background: #f1f1f3; }
+  .platform[data-verdict='speculation'] { background: #f3edfa; }
 
   .head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; }
 
@@ -521,10 +525,36 @@
   .group-badge.interface { color: #1a6b4a; background: #e3f3ea; }
   .group-badge.api { color: #2a548f; background: #e5eef9; }
 
-  /* A faint left rail on the whole card, matching the section-level accent
-     in QuestionTimeline, so an API card still reads as "API" even scrolled
-     out of its group header's view. */
-  .platform[data-group='api'] { border-left: 2px solid #dbe6f5; }
+  /* Align browser and API cards within each platform comparison. */
+  .platform.comparison {
+    min-width: 0;
+    padding: 1rem;
+    border-radius: 6px;
+    border: 1px solid var(--line);
+  }
+  .comparison .head {
+    min-height: 1.5rem;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    margin-bottom: 0.35rem;
+  }
+  .comparison .name {
+    font-size: 0.8rem;
+    font-weight: 650;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--text);
+  }
+  .comparison .group-badge { display: none; }
+  .comparison .session { margin-left: auto; }
+  .comparison .when { margin-bottom: 0.8rem; }
+  .comparison .answer { font-size: 0.88rem; line-height: 1.7; }
+  .comparison .cites { margin-top: 0.85rem; padding-top: 0; }
+  .comparison .grade { margin-top: auto; padding-top: 0.7rem; border-top: 0; flex-wrap: wrap; }
+  .comparison .verdict { border-color: transparent; border-radius: 3px; }
+  .comparison .verdict:hover,
+  .comparison .verdict:focus-visible { border-color: var(--muted); }
+  .comparison .answer-tools { margin-bottom: 0.35rem; }
 
   /* Sits with the platform name; the auto margin keeps the session link on the
      far right rather than letting three items space themselves evenly. */

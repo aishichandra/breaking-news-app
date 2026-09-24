@@ -17,6 +17,13 @@
   const interfaceGroup = PLATFORM_GROUPS.find((g) => g.id === 'interface')
   const apiGroup = PLATFORM_GROUPS.find((g) => g.id === 'api')
 
+  const comparisons = [
+    { label: 'ChatGPT / GPT-4o', browser: 'chatgpt', api: ['gpt4o-no-search', 'gpt4o-web-search'] },
+    { label: 'Claude Sonnet 4', browser: 'claude', api: ['claude-sonnet4-no-search', 'claude-sonnet4-web-search'] },
+    { label: 'Perplexity', browser: 'perplexity', api: ['perplexity-api'] },
+    { label: 'Google AI Overview', browser: 'google', api: ['google-ai-overview-api'] }
+  ]
+
   function apiAnsweredCount(run) {
     return apiGroup.names.filter((n) => run.platforms?.[n]?.answer).length
   }
@@ -52,7 +59,35 @@
             <span class="run-num">{i + 1} of {runs.length}</span>
           </header>
 
-          <div class="group">
+          <button type="button" class="group-label toggle" aria-expanded={platformView.showApi} onclick={toggleShowApi}>
+            <span class="chevron" aria-hidden="true">{platformView.showApi ? '▾' : '▸'}</span>
+            Compare browser + API
+            <span class="count">{apiAnsweredCount(run)}/{apiGroup.names.length} API answers</span>
+          </button>
+          {#if platformView.showApi}
+            {#each comparisons as platform}
+              <section class="comparison">
+                <h3>{platform.label}</h3>
+                <div class="comparison-grid" class:pair={platform.api.length === 1}>
+                  {#each [platform.browser, ...platform.api] as name}
+                    <PlatformAnswer
+                      {name}
+                      comparison={true}
+                      displayName={name === platform.browser ? 'Browser' : name.endsWith('no-search') ? 'API · No search' : 'API · Web search'}
+                      {publishedAt}
+                      {articleId}
+                      {questionIndex}
+                      {terms}
+                      result={run.platforms?.[name]}
+                      runId={run.run_id}
+                      onGraded={(platform, verdict) => onGraded(String(run.run_id), platform, verdict)}
+                      {onCitationSaved}
+                    />
+                  {/each}
+                </div>
+              </section>
+            {/each}
+          {:else}
             <div class="group-label">{interfaceGroup.label}</div>
             <div class="grid">
               {#each interfaceGroup.names as name}
@@ -69,37 +104,7 @@
                 />
               {/each}
             </div>
-          </div>
-
-          <div class="group api">
-            <button type="button" class="group-label toggle" onclick={toggleShowApi}>
-              <span class="chevron" aria-hidden="true">{platformView.showApi ? '▾' : '▸'}</span>
-              {apiGroup.label}
-              <span class="count">({apiAnsweredCount(run)}/{apiGroup.names.length})</span>
-            </button>
-            {#if platformView.showApi}
-              {#each apiGroup.subgroups as subgroup}
-                <div class="subgroup">
-                  <div class="subgroup-label" title={subgroup.hint}>{subgroup.label}</div>
-                  <div class="grid">
-                    {#each subgroup.names as name}
-                      <PlatformAnswer
-                        {name}
-                        {publishedAt}
-                        {articleId}
-                        {questionIndex}
-                        {terms}
-                        result={run.platforms?.[name]}
-                        runId={run.run_id}
-                        onGraded={(platform, verdict) => onGraded(String(run.run_id), platform, verdict)}
-                        {onCitationSaved}
-                      />
-                    {/each}
-                  </div>
-                </div>
-              {/each}
-            {/if}
-          </div>
+          {/if}
         </div>
       </li>
     {/each}
@@ -209,16 +214,22 @@
     .grid { grid-template-columns: minmax(0, 1fr); }
   }
 
-  .group + .group { margin-top: 0.7rem; }
-
-  .subgroup + .subgroup { margin-top: 0.55rem; }
-
-  .subgroup-label {
-    margin: 0 0 0.35rem;
-    font-size: 0.62rem;
-    font-weight: 600;
-    font-style: italic;
-    color: var(--muted);
+  .comparison { margin-top: 1.25rem; }
+  .comparison h3 {
+    margin: 0 0 0.65rem;
+    font-size: 0.95rem;
+    font-weight: 650;
+    color: var(--text);
+  }
+  .comparison-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.85rem;
+    align-items: stretch;
+  }
+  .comparison-grid.pair { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  @media (max-width: 850px) {
+    .comparison-grid, .comparison-grid.pair { grid-template-columns: minmax(0, 1fr); }
   }
 
   .group-label {
@@ -251,10 +262,5 @@
   .chevron { width: 0.7rem; font-size: 0.8rem; }
   .count { font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--muted); }
 
-  /* A quiet accent, not a loud one — this is a provenance cue to notice while
-     scanning, not a warning. */
-  .group.api {
-    padding-left: 0.6rem;
-    border-left: 2px solid #dbe6f5;
-  }
+
 </style>

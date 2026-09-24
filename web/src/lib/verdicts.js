@@ -1,19 +1,28 @@
-// gpt-4o/Claude are each asked both ways, so whether the model could see the
-// web is the difference worth separating on within the API group.
-// Perplexity's API and Google's AI Overview have no "no search" mode —
-// they're always search-grounded — so both live in the search subgroup.
+// Keep search and no-search answers together for each API platform.
 const API_SUBGROUPS = [
   {
-    id: 'api-no-search',
-    label: 'No search',
-    hint: "Answered from the model's own training data alone, no web access",
-    names: ['gpt4o-no-search', 'claude-sonnet4-no-search']
+    id: 'api-gpt4o',
+    label: 'GPT-4o',
+    hint: 'Compare GPT-4o with and without web search',
+    names: ['gpt4o-no-search', 'gpt4o-web-search']
   },
   {
-    id: 'api-search',
-    label: 'With search',
-    hint: 'Answered with live web search grounding it',
-    names: ['gpt4o-web-search', 'claude-sonnet4-web-search', 'perplexity-api', 'google-ai-overview-api']
+    id: 'api-claude',
+    label: 'Claude Sonnet 4',
+    hint: 'Compare Claude with and without web search',
+    names: ['claude-sonnet4-no-search', 'claude-sonnet4-web-search']
+  },
+  {
+    id: 'api-perplexity',
+    label: 'Perplexity',
+    hint: 'Search-grounded API response',
+    names: ['perplexity-api']
+  },
+  {
+    id: 'api-google',
+    label: 'Google AI Overview',
+    hint: 'Search-grounded API response',
+    names: ['google-ai-overview-api']
   }
 ]
 

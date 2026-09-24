@@ -64,7 +64,7 @@
       <button class:active={tab === 'add'} onclick={() => (tab = 'add')}>
         Add data
       </button>
-      <label class="api-switch" title="The 6 raw-API columns, off by default to keep the page from feeling overwhelming">
+      <label class="api-switch" title="Show model answers from direct API calls">
         <input type="checkbox" checked={platformView.showApi} onchange={toggleShowApi} />
         Show API answers
       </label>
