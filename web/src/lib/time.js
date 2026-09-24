@@ -219,7 +219,7 @@ export function formatSourceStamp(value, precision) {
   if (!d) return null
   return d.toLocaleString('en-US',
     precision === 'date'
-      ? { dateStyle: 'medium' }
+      ? { dateStyle: 'medium', timeZone: 'UTC' }
       : { dateStyle: 'medium', timeStyle: 'short' }
   )
 }

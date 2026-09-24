@@ -209,10 +209,14 @@ async function attachSourceDates(articles) {
 
   const sources = await db
     .collection('sources')
-    .find({ url: { $in: [...urls] }, method: 'manual' })
+    .find({ url: { $in: [...urls] }, method: { $in: ['manual', 'pagedatefinder'] } })
     .toArray()
 
-  const byUrl = new Map(sources.map((s) => [s.url, s]))
+  const byUrl = new Map()
+  for (const source of sources) {
+    // Manual corrections (including explicit clearing) always win.
+    if (!byUrl.has(source.url) || source.method === 'manual') byUrl.set(source.url, source)
+  }
 
   forEachCitation(articles, (c) => {
     const source = byUrl.get(canonicalUrl(c.url))
@@ -1105,11 +1109,17 @@ app.post('/api/sources', async (req, res) => {
       return res.status(400).json({ error: "precision must be 'date' or 'datetime'" })
     }
 
+    const invalid = items.find((s) =>
+      (s?.method != null && !['manual', 'pagedatefinder'].includes(s.method)) ||
+      (s?.published_at && Number.isNaN(new Date(s.published_at).getTime()))
+    )
+    if (invalid) return res.status(400).json({ error: 'Invalid source method or publication date' })
+
     const ops = items
       .filter((s) => s?.url)
       .map((s) => ({
         updateOne: {
-          filter: { url: canonicalUrl(s.url) },
+          filter: { url: canonicalUrl(s.url), method: s.method ?? 'manual' },
           update: {
             $set: {
               url: canonicalUrl(s.url),
@@ -1118,7 +1128,7 @@ app.post('/api/sources', async (req, res) => {
               // record saying "we looked and don't know", not "midnight".
               precision: s.published_at ? s.precision ?? 'datetime' : null,
               status: 'ok',
-              method: 'manual',
+              method: s.method ?? 'manual',
               resolved_at: new Date()
             }
           },

@@ -27,7 +27,8 @@ function normalizePlatform(raw, fallbackStamp) {
     citations: (Array.isArray(cites) ? cites : []).map((c) => ({
       label: c.label ?? '',
       url: c.url ?? null,
-      trust: c.trust ?? null
+      trust: c.trust ?? null,
+      date_time: typeof c.date_time === 'string' ? c.date_time : null
     })),
     // Google only, and only when answers.py managed to capture one --
     // GridFS id of the AI Overview page screenshot, uploaded by the
@@ -65,7 +66,8 @@ export function normalizeEntry(entry) {
       citations: (Array.isArray(cites) ? cites : []).map((c) => ({
         label: c.label ?? '',
         url: c.url ?? null,
-        trust: c.trust ?? null
+        trust: c.trust ?? null,
+        date_time: typeof c.date_time === 'string' ? c.date_time : null
       }))
     }
   }).filter(Boolean)
