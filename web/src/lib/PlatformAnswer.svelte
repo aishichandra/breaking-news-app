@@ -3,7 +3,8 @@
   import { API } from './api.js'
   import CitationRow from './CitationRow.svelte'
   import { highlightSegments } from './highlight.js'
-  import { describeLag, formatDateTime } from './time.js'
+  import { parsePastedAnswer } from './parseCitations.js'
+  import { describeLag, domainOf, formatDateTime } from './time.js'
   import { PLATFORM_LABELS as LABELS, GROUP_OF, VERDICTS } from './verdicts.js'
 
   let {
@@ -33,7 +34,13 @@
   )
 
 
-  const citations = $derived(effectiveResult?.citations ?? [])
+  // Citations parsed from a pasted answer for a record that had none (see
+  // saveAnswer) -- held here like addedResult, until the parent's own refetch
+  // brings the saved set back, at which point that one wins.
+  let addedCitations = $state(null)
+  const citations = $derived(
+    effectiveResult?.citations?.length ? effectiveResult.citations : (addedCitations ?? [])
+  )
   // Google only -- a screenshot of the AI Overview page at the moment it was
   // captured (or the failure happened), evidence for verifying the
   // extraction or diagnosing a miss without reproducing the search live.
@@ -68,6 +75,24 @@
   let newAnswerDraft = $state('')
   let savingNewAnswer = $state(false)
   let addError = $state(null)
+
+  // The links found in whatever is pasted, offered as citations. Each can be
+  // dropped before saving -- a bare URL in the middle of prose isn't always a
+  // source. Kept as a list, not a Set, so the derived values below re-run.
+  let droppedUrls = $state([])
+  const withoutDropped = (list) => list.filter((c) => !droppedUrls.includes(c.url))
+
+  const addParsed = $derived(parsePastedAnswer(newAnswerDraft))
+  const addCitations = $derived(withoutDropped(addParsed.citations))
+
+  // Editing only offers this when the record has no citations at all: a
+  // scraped set is the evidence, and isn't replaced by what's typed in later.
+  const editParsed = $derived(editingAnswer && citations.length === 0 ? parsePastedAnswer(draftAnswer) : null)
+  const editCitations = $derived(editParsed ? withoutDropped(editParsed.citations) : [])
+
+  function dropCitation(url) {
+    droppedUrls = [...droppedUrls, url]
+  }
 
   // Only worth offering when there is something to go back to: an edit made to
   // fill in a blank scrape has nothing useful to restore.
@@ -139,6 +164,7 @@
 
   function openAnswerEdit() {
     draftAnswer = answerText
+    droppedUrls = []
     editingAnswer = true
     saveError = null
   }
@@ -163,8 +189,9 @@
   // Correcting a scrape leaves the platform's own text intact server-side, so
   // the reply carries back whichever of those fields the save established.
   async function saveAnswer() {
-    const next = draftAnswer.trim()
-    if (next === answerText) {
+    const next = (editParsed ? editParsed.answer : draftAnswer).trim()
+    const textChanged = next !== answerText
+    if (!textChanged && editCitations.length === 0) {
       cancelAnswerEdit()
       return
     }
@@ -173,10 +200,19 @@
     saveError = null
 
     try {
-      const saved = await patchAnswer({ answer: next })
-      answerText = saved.answer ?? next
-      if (saved.answer_original != null) originalAnswer = saved.answer_original
-      editedAt = saved.answer_edited_at ?? new Date().toISOString()
+      // Only what changed is sent, so adding citations to an answer whose text
+      // is fine doesn't mark the text as edited.
+      const body = {}
+      if (textChanged) body.answer = next
+      if (editCitations.length > 0) body.citations = editCitations
+
+      const saved = await patchAnswer(body)
+      if (textChanged) {
+        answerText = saved.answer ?? next
+        if (saved.answer_original != null) originalAnswer = saved.answer_original
+        editedAt = saved.answer_edited_at ?? new Date().toISOString()
+      }
+      if (saved.citations?.length) addedCitations = saved.citations
       editingAnswer = false
     } catch (err) {
       saveError = err.message
@@ -187,6 +223,7 @@
 
   function openAddAnswer() {
     newAnswerDraft = ''
+    droppedUrls = []
     addingAnswer = true
     addError = null
   }
@@ -201,7 +238,7 @@
   // fresh one. Held in addedResult afterward so the rest of the component
   // (grading, notes, further edits) treats it exactly like a scraped result.
   async function saveNewAnswer() {
-    const text = newAnswerDraft.trim()
+    const text = addParsed.answer
     if (!text) return
 
     savingNewAnswer = true
@@ -211,7 +248,7 @@
       const res = await fetch(`${API}/api/articles/${articleId}/questions/${questionIndex}/answers`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ run_id: runId, platform: name, answer: text })
+        body: JSON.stringify({ run_id: runId, platform: name, answer: text, citations: addCitations })
       })
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}))
@@ -258,6 +295,25 @@
   }
 </script>
 
+{#snippet citationPreview(list, draft)}
+  {#if list.length > 0}
+    <div class="parsed">
+      <p class="parsed-head">{list.length} citation{list.length === 1 ? '' : 's'} found in this text</p>
+      <ul>
+        {#each list as c (c.url)}
+          <li>
+            <span class="parsed-label" title={c.url}>{c.label}</span>
+            <span class="parsed-domain">{domainOf(c.url)}</span>
+            <button type="button" class="link" onclick={() => dropCitation(c.url)} title="Not a source — leave it out">remove</button>
+          </li>
+        {/each}
+      </ul>
+    </div>
+  {:else if draft}
+    <p class="parsed-head none">No links found — paste the answer with its links (copy as markdown) to capture citations.</p>
+  {/if}
+{/snippet}
+
 <div class="platform" data-verdict={verdict} data-group={group}>
   <div class="head">
     <span class="name">{LABELS[name] ?? name}</span>
@@ -296,6 +352,7 @@
           use:focusOnOpen
           placeholder="What the platform actually said…"
         ></textarea>
+        {#if editParsed}{@render citationPreview(editCitations, draftAnswer.trim())}{/if}
         <div class="answer-actions">
           <button type="button" class="save-note" onclick={saveAnswer} disabled={savingAnswer}>
             {savingAnswer ? 'Saving…' : 'Save answer'}
@@ -407,10 +464,11 @@
         rows="8"
         onkeydown={handleNewAnswerKey}
         use:focusOnOpen
-        placeholder="What the platform actually said…"
+        placeholder="Paste what the platform said — links in it are parsed into citations"
       ></textarea>
+      {@render citationPreview(addCitations, newAnswerDraft.trim())}
       <div class="answer-actions">
-        <button type="button" class="save-note" onclick={saveNewAnswer} disabled={savingNewAnswer || !newAnswerDraft.trim()}>
+        <button type="button" class="save-note" onclick={saveNewAnswer} disabled={savingNewAnswer || !addParsed.answer}>
           {savingNewAnswer ? 'Saving…' : 'Save answer'}
         </button>
         <button type="button" class="link" onclick={cancelAddAnswer}>Cancel</button>
@@ -533,6 +591,21 @@
 
   /* The shared .link rule adds top margin for its usual standalone use. */
   .answer-actions .link { margin-top: 0; }
+
+  .parsed { margin-top: 0.45rem; }
+  .parsed-head { margin: 0.45rem 0 0.25rem; font-size: 0.68rem; color: var(--muted); }
+  .parsed ul { margin: 0; padding: 0; list-style: none; }
+  .parsed li {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding: 0.15rem 0;
+    font-size: 0.7rem;
+    border-bottom: 1px solid var(--line);
+  }
+  .parsed-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .parsed-domain { color: var(--muted); white-space: nowrap; }
+  .parsed li .link { margin-top: 0; }
 
   .comment { margin-top: 0.45rem; }
   .comment textarea {

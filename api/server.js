@@ -4,7 +4,7 @@ import { createHash, timingSafeEqual } from 'node:crypto'
 import express from 'express'
 import cors from 'cors'
 import { GridFSBucket, MongoClient, ObjectId } from 'mongodb'
-import { buildQuestions, PLATFORMS } from './normalize.js'
+import { buildQuestions, cleanManualCitations, PLATFORMS } from './normalize.js'
 import { milestoneForRun, runAskedAt } from './reask-schedule.js'
 
 const MONGODB_URI = process.env.MONGODB_URI
@@ -1183,7 +1183,7 @@ app.get('/api/export.csv', (req, res) => {
 })
 
 // Grade one answer — that is, one platform's response in one specific run.
-// PATCH /api/answers/:id  { verdict, note, answer }
+// PATCH /api/answers/:id  { verdict, note, answer, citations }
 app.patch('/api/answers/:id', async (req, res) => {
   try {
     const { id } = req.params
@@ -1209,29 +1209,45 @@ app.patch('/api/answers/:id', async (req, res) => {
       $set.note = text || null
     }
 
+    if ('answer' in body && typeof answer !== 'string') {
+      return res.status(400).json({ error: 'answer must be a string' })
+    }
+    if ('citations' in body && !Array.isArray(body.citations)) {
+      return res.status(400).json({ error: 'citations must be an array' })
+    }
+
+    let existing = null
+    if ('answer' in body || 'citations' in body) {
+      existing = await db
+        .collection('answers')
+        .findOne({ _id: new ObjectId(id) }, { projection: { answer: 1, answer_original: 1, citations: 1 } })
+
+      if (!existing) {
+        return res.status(404).json({ error: 'Answer not found' })
+      }
+    }
+
     // A scrape that mangled the response — truncated it, dropped a paragraph,
     // swallowed the markup — can be corrected by hand. What the platform
     // actually returned is the evidence this whole study rests on, though, so
     // the first correction stashes the scraped text under `answer_original`
     // and later ones leave that untouched. Both fields go out in the export.
     if ('answer' in body) {
-      if (typeof answer !== 'string') {
-        return res.status(400).json({ error: 'answer must be a string' })
-      }
-
-      const existing = await db
-        .collection('answers')
-        .findOne({ _id: new ObjectId(id) }, { projection: { answer: 1, answer_original: 1 } })
-
-      if (!existing) {
-        return res.status(404).json({ error: 'Answer not found' })
-      }
-
       $set.answer = answer.trim()
       $set.answer_edited_at = new Date()
       if (existing.answer_original === undefined) {
         $set.answer_original = existing.answer ?? ''
       }
+    }
+
+    // Filling in citations the scrape missed (parsed from a pasted answer).
+    // Only ever into an empty list: a scraped set is the evidence the study
+    // rests on, so it isn't replaced by anything typed in later.
+    if ('citations' in body) {
+      if ((existing.citations ?? []).length > 0) {
+        return res.status(409).json({ error: 'This answer already has citations — they are not overwritten' })
+      }
+      $set.citations = cleanManualCitations(body.citations)
     }
 
     if (Object.keys($set).length === 0) {
@@ -1252,7 +1268,8 @@ app.patch('/api/answers/:id', async (req, res) => {
       verdict,
       answer: $set.answer,
       answer_original: $set.answer_original,
-      answer_edited_at: $set.answer_edited_at
+      answer_edited_at: $set.answer_edited_at,
+      citations: $set.citations
     })
   } catch (err) {
     console.error(err)
@@ -1383,7 +1400,7 @@ app.post('/api/articles/:id/questions/:index/answers', async (req, res) => {
       asked_at: null,
       answer: text,
       url: typeof url === 'string' && url.trim() ? url.trim() : null,
-      citations: Array.isArray(citations) ? citations : [],
+      citations: cleanManualCitations(citations),
       verdict: null,
       graded_at: null,
       note: null,

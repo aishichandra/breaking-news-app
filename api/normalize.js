@@ -37,6 +37,35 @@ function normalizePlatform(raw, fallbackStamp) {
   }
 }
 
+// Citations entered by hand (parsed out of a pasted answer in the UI) arrive as
+// client input, unlike scraped ones, so they're checked rather than trusted:
+// only http(s) URLs, one entry per URL, a label always present. Anything else
+// is dropped rather than failing the whole save -- the answer text is the part
+// that matters.
+const MAX_MANUAL_CITATIONS = 100
+
+export function cleanManualCitations(input) {
+  if (!Array.isArray(input)) return []
+
+  const byUrl = new Map()
+  for (const c of input) {
+    const url = typeof c?.url === 'string' ? c.url.trim() : ''
+    if (!/^https?:\/\/[^\s/]+/i.test(url) || byUrl.has(url)) continue
+
+    let label = typeof c.label === 'string' ? c.label.trim().slice(0, 200) : ''
+    if (!label) {
+      try {
+        label = new URL(url).hostname.replace(/^www\./, '')
+      } catch {
+        continue
+      }
+    }
+    byUrl.set(url, { label, url, trust: null })
+    if (byUrl.size >= MAX_MANUAL_CITATIONS) break
+  }
+  return [...byUrl.values()]
+}
+
 // Merges the two arrays you paste in:
 //   groundTruth    [{ question, answer }]                     — position = question_index
 //   platformAnswers[{ question_index, timestamp, question, google, chatgpt, ... }]
