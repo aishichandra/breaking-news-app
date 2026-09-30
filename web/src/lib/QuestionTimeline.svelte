@@ -1,13 +1,14 @@
 <script>
   import PlatformAnswer from './PlatformAnswer.svelte'
   import { formatDateTime, runAskedAt } from './time.js'
-  import { PLATFORM_GROUPS } from './verdicts.js'
+  import { PLATFORM_GROUPS, modelLabel } from './verdicts.js'
   import { platformView, toggleShowApi } from './platformView.svelte.js'
 
   let {
     runs = [],
     publishedAt = null,
     articleId,
+    sourceUrl = null,
     questionIndex,
     terms = null,
     onGraded = () => {},
@@ -18,8 +19,8 @@
   const apiGroup = PLATFORM_GROUPS.find((g) => g.id === 'api')
 
   const comparisons = [
-    { label: 'ChatGPT / GPT-4o', browser: 'chatgpt', api: ['gpt4o-no-search', 'gpt4o-web-search'] },
-    { label: 'Claude Sonnet 4', browser: 'claude', api: ['claude-sonnet4-no-search', 'claude-sonnet4-web-search'] },
+    { label: 'ChatGPT / OpenAI', browser: 'chatgpt', api: ['gpt4o-no-search', 'gpt4o-web-search'] },
+    { label: 'Claude', browser: 'claude', api: ['claude-sonnet4-no-search', 'claude-sonnet4-web-search'] },
     { label: 'Perplexity', browser: 'perplexity', api: ['perplexity-api'] },
     { label: 'Google AI Overview', browser: 'google', api: ['google-ai-overview-api'] }
   ]
@@ -69,13 +70,14 @@
               <section class="comparison">
                 <h3>{platform.label}</h3>
                 <div class="comparison-grid" class:pair={platform.api.length === 1}>
-                  {#each [platform.browser, ...platform.api] as name}
+                  {#each [platform.browser, ...platform.api.flatMap((name) => name === 'google-ai-overview-api' ? [name] : [name, `${name}-recent-news`])] as name}
                     <PlatformAnswer
                       {name}
                       comparison={true}
-                      displayName={name === platform.browser ? 'Browser' : name.endsWith('no-search') ? 'API · No search' : 'API · Web search'}
+                      displayName={name === platform.browser ? 'Browser' : `${modelLabel(name,run.platforms?.[name])} · API · ${name.includes('no-search') ? 'No search' : 'Web search'} · ${name.endsWith('-recent-news') ? 'Most recent news' : 'Original question'}`}
                       {publishedAt}
                       {articleId}
+                      {sourceUrl}
                       {questionIndex}
                       {terms}
                       result={run.platforms?.[name]}
@@ -95,6 +97,7 @@
                   {name}
                   {publishedAt}
                   {articleId}
+                  {sourceUrl}
                   {questionIndex}
                   {terms}
                   result={run.platforms?.[name]}

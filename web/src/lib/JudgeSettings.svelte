@@ -1,0 +1,10 @@
+<script>
+ import {onMount} from 'svelte'
+ import {API} from './api.js'
+ import {judgeSettings,loadJudgeSettings} from './judgeSettings.svelte.js'
+ let busy=$state(false),error=$state('')
+ onMount(()=>{void loadJudgeSettings()})
+ async function change(event){busy=true;error='';try{const r=await fetch(`${API}/api/judge/settings`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({automatic:event.currentTarget.checked})});if(!r.ok)throw Error('Could not save judge setting');Object.assign(judgeSettings,await r.json())}catch(e){error=e.message}finally{busy=false}}
+</script>
+<details class="judge-settings"><summary>LLM judge · {judgeSettings.configured?(judgeSettings.automatic?'Automatic first pass':'On demand'):'Not configured'}</summary><p>Proposes accuracy grades using the saved expected answer and article excerpt. Suggestions become final only when you accept them or grade manually.</p><label><input type="checkbox" checked={judgeSettings.automatic&&judgeSettings.configured} disabled={busy||!judgeSettings.configured} onchange={change}/> Automatically judge all captured answers</label><small>Existing and new browser and API answers are assessed in the background. Existing human grades stay unchanged. Accept suggestions for ungraded answers, or choose a different grade. Turning this off stops automatic discovery; already queued work will finish.</small><small>Judge: {judgeSettings.model||'Loading…'} · OpenRouter</small>{#if judgeSettings.loaded&&!judgeSettings.configured}<p>Set OPENROUTER_API_KEY on the app server to enable judging. JUDGE_MODEL can override the model.</p>{/if}{#if error||judgeSettings.error}<p role="alert">{error||judgeSettings.error}</p>{/if}</details>
+<style>.judge-settings{margin:12px 0 20px;padding:12px 16px;border:1px solid var(--line);border-radius:6px;font-size:12px;color:var(--muted)}summary{cursor:pointer;color:var(--text)}p{line-height:1.6;max-width:800px}small{display:block;margin-top:9px}label{display:block;margin:12px 0}input{margin-right:7px}</style>

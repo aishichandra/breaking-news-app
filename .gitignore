@@ -4,3 +4,11 @@ dist/
 *.log
 __pycache__/
 .DS_Store
+
+.env.*
+!.env.example
+*.sqlite3*
+*.jsonl
+
+*.enc
+*.partial-*

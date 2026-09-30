@@ -1,4 +1,5 @@
 <script>
+  import {safeHttpUrl} from '../../../safe-url.mjs'
   import { untrack } from 'svelte'
   import { API } from './api.js'
   import {
@@ -131,7 +132,7 @@
 
 <tr>
   <td class="src">
-    <a href={citation.url} target="_blank" rel="noreferrer" title={citation.label}>
+    <a href={safeHttpUrl(citation.url)??undefined} target="_blank" rel="noreferrer" title={citation.label}>
       {domain}
     </a>
 

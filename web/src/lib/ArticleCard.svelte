@@ -1,4 +1,6 @@
 <script>
+  import {articleHeadlines} from '../../../article-headlines.mjs'
+  import {safeHttpUrl} from '../../../safe-url.mjs'
   import { API } from './api.js'
   import QuestionBlock from './QuestionBlock.svelte'
   import ReaskStatus from './ReaskStatus.svelte'
@@ -8,6 +10,10 @@
 
   let { article, onDeleted, onCitationSaved = () => {}, onUpdated = () => {} } = $props()
 
+
+  const headlines = $derived(articleHeadlines(article))
+  const latestHeadline = $derived(headlines.at(-1)?.headline ?? '')
+  const previousHeadlines = $derived(headlines.slice(0,-1).reverse())
 
   let deleting = $state(false)
   let error = $state(null)
@@ -249,8 +255,17 @@
 <article class="card">
   <header>
     <div class="meta">
+      {#if latestHeadline}<h2 class="article-headline">{latestHeadline}</h2>{/if}
+      {#if previousHeadlines.length}
+        <details class="headline-history">
+          <summary>Previous headlines ({previousHeadlines.length})</summary>
+          <ul>{#each previousHeadlines as entry}
+            <li><span>{entry.headline}</span>{#if entry.observed_at}<small>Captured {formatDateTime(entry.observed_at)}</small>{/if}</li>
+          {/each}</ul>
+        </details>
+      {/if}
       <div class="title-row">
-        <a href={article.url} target="_blank" rel="noreferrer">{article.url}</a>
+        <a href={safeHttpUrl(article.url)??undefined} target="_blank" rel="noreferrer">{article.url}</a>
         <label class="excl" title="Only one outlet has this story — no wire copy or aggregators for a platform to lean on">
           <input
             type="checkbox"
@@ -435,6 +450,7 @@
       index={i}
       publishedAt={article.published_at}
       articleId={article._id}
+      sourceUrl={article.url}
       {onCitationSaved}
       onFlagged={onUpdated}
     />
@@ -442,6 +458,13 @@
 </article>
 
 <style>
+  .article-headline { font-size:1.15rem; line-height:1.4; margin:0 0 .45rem; font-weight:600; overflow-wrap:anywhere; }
+  .headline-history { margin:0 0 .6rem; font-size:.8rem; }
+  .headline-history summary { cursor:pointer; color:var(--muted); }
+  .headline-history ul { padding-left:1.2rem; }
+  .headline-history li { margin:.5rem 0; }
+  .headline-history small { display:block; color:var(--muted); margin-top:.2rem; }
+
   .card { background: var(--card); border: 1px solid var(--line); padding: 1.1rem 1.25rem; margin-bottom: 1.25rem; }
 
   /* Bleed the band to the card edges by cancelling the card's own padding, so

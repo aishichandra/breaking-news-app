@@ -1,3 +1,26 @@
+import {registerSourceDates} from './source-dates.js'
+import {registerAnswerReview} from './answer-review.js'
+import {registerVerdictCategories} from './verdict-categories.js'
+import {registerArchive} from './archive.js'
+import {registerArticleIngestion} from './article-ingestion.js'
+import {authentication} from './auth.js'
+import {reviewAudit} from './review-audit.js'
+import {registerArticleReads} from './article-reads.js'
+import {assertAuthentication,productionEnvironment,allowedOrigin,requestSecurity} from './security.js'
+import {validateIngestion,validDate,questionKey,ingestionRunId,answerUpserts,resolveQuestion} from './ingestion.js'
+import {safeHttpUrl} from '../safe-url.mjs'
+import {registerQuestionRetries,attachQuestionRetries} from './question-retries.js'
+import { activeDataset } from '../active-dataset.mjs'
+import { registerDomainLibrary } from './domain-library.js'
+import { createLiveHistory } from './live-history.js'
+import { tmpdir } from 'node:os'
+import { gzip } from 'node:zlib'
+import { promisify } from 'node:util'
+const gzipHistory = promisify(gzip)
+import { createReviewCache, updateCachedAnswer } from './review-cache.js'
+import { registerCitationTypes } from './citation-types.js'
+import { confidenceUpdate } from './confidence.js'
+import { sourceCitationStatus } from '../source-match.mjs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash, timingSafeEqual } from 'node:crypto'
@@ -7,6 +30,7 @@ import { GridFSBucket, MongoClient, ObjectId } from 'mongodb'
 import { buildQuestions, cleanManualCitations, PLATFORMS } from './normalize.js'
 import { milestoneForRun, runAskedAt } from './reask-schedule.js'
 
+assertAuthentication(process.env)
 const MONGODB_URI = process.env.MONGODB_URI
 
 // Name the problem in one line. Handing undefined to MongoClient throws deep
@@ -19,7 +43,10 @@ if (!MONGODB_URI) {
   process.exit(1)
 }
 
-const client = new MongoClient(MONGODB_URI)
+if (process.env.LOCAL_REVIEW === '1' && process.env.MONGODB_DB !== 'breaking_news_local_review') {
+  throw new Error('Local review requires the isolated breaking_news_local_review database')
+}
+const client = new MongoClient(MONGODB_URI, { compressors: ['zlib'] })
 // Overridable so the API can be pointed at a scratch database for end-to-end
 // checks without writing into the live collections.
 const db = client.db(process.env.MONGODB_DB || 'breaking_news')
@@ -127,7 +154,7 @@ function forEachCitation(articles, fn) {
 // come from the same documents, so this reads them once. Fetching twice — an
 // aggregation for the latest and a find for the history — pulled every answer
 // across the wire twice on every page load.
-async function attachAnswers(articles) {
+async function attachAnswers(articles, {summary = false, study = false} = {}) {
   const questionIds = []
   for (const article of articles) {
     for (const question of article.questions ?? []) {
@@ -138,12 +165,14 @@ async function attachAnswers(articles) {
 
   const docs = await db
     .collection('answers')
-    .find({ question_id: { $in: questionIds } })
+    .find({ question_id: { $in: questionIds } }, summary ? {projection: {_id:1, article_id:1, question_id:1, platform:1, run_id:1, run_at:1, asked_at:1, verdict:1, confidence:1, question_variant:1,model:1,has_response:{$ne:[{$trim:{input:{$ifNull:['$answer','']}}},'']},...(study?{citations:1}: {})}} : {})
     .sort({ run_at: 1, platform: 1 })
     .toArray()
 
+  const sourceUrls = new Map(articles.map((article) => [String(article._id), article.url]))
   const byQuestion = new Map()
   for (const doc of docs) {
+    doc.original_source_cited = sourceCitationStatus(sourceUrls.get(String(doc.article_id)), doc.citations)
     const qKey = String(doc.question_id)
     let entry = byQuestion.get(qKey)
     if (!entry) {
@@ -241,7 +270,9 @@ async function attachReaskQueue(articles) {
 }
 
 const app = express()
-app.use(cors())
+app.disable('x-powered-by')
+app.use(requestSecurity())
+app.use(cors((req, done) => done(null, {origin: allowedOrigin(req) ? req.get('Origin') || false : false})))
 app.use(express.json({ limit: '5mb' }))
 
 // Registered above the auth gate so uptime checks keep working once a password
@@ -250,54 +281,87 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true })
 })
 
-// Optional HTTP Basic Auth. Off when AUTH_PASSWORD is unset, so local dev is
-// unchanged; set it in Railway and the whole app (UI and API) requires it.
-const AUTH_USER = process.env.AUTH_USER || 'admin'
-const AUTH_PASSWORD = process.env.AUTH_PASSWORD
+app.use(authentication())
+app.use(reviewAudit(db))
 
-// Compare digests rather than raw strings: timingSafeEqual needs equal-length
-// buffers, and a plain === leaks length and prefix through timing.
-const digest = (value) => createHash('sha256').update(String(value)).digest()
-const matches = (a, b) => timingSafeEqual(digest(a), digest(b))
-
-if (AUTH_PASSWORD) {
-  app.use((req, res, next) => {
-    const [scheme, encoded] = (req.headers.authorization ?? '').split(' ')
-
-    if (scheme === 'Basic' && encoded) {
-      const decoded = Buffer.from(encoded, 'base64').toString()
-      const separator = decoded.indexOf(':')
-      const user = decoded.slice(0, separator)
-      const password = decoded.slice(separator + 1)
-
-      if (matches(user, AUTH_USER) && matches(password, AUTH_PASSWORD)) return next()
-    }
-
-    res.set('WWW-Authenticate', 'Basic realm="Breaking News Benchmark"')
-    res.status(401).send('Authentication required')
-  })
-} else {
-  console.log('AUTH_PASSWORD not set — running without authentication')
-}
+app.get('/api/environment', async (req, res) => {
+  const snapshot = process.env.LOCAL_REVIEW === '1' ? await db.collection('_local_meta').findOne({_id:'snapshot'}) : null
+  res.json({local:process.env.LOCAL_REVIEW === '1', snapshot_at:snapshot?.created_at??null})
+})
+registerCitationTypes(app, db)
+registerDomainLibrary(app, db)
 
 // Newest addition first. Ordering on when a row was *added* rather than when
 // the story was published keeps whatever you just entered at the top of the
 // page, which is where you go looking for it.
-app.get('/api/articles', async (req, res) => {
-  try {
+async function loadArticleHistory() {
     const articles = await db
       .collection('articles')
       .aggregate([
         // Rows written before created_at existed fall back to the timestamp
         // baked into their ObjectId, so they sort sensibly instead of sinking
         // to the bottom as nulls.
+        { $match: {deleted_at: {$exists:false}} },
         { $addFields: { added_at: { $ifNull: ['$created_at', { $toDate: '$_id' }] } } },
         { $sort: { added_at: -1 } },
         { $unset: 'added_at' }
       ])
       .toArray()
 
-    res.json(await attachReaskQueue(await attachSourceDates(await attachAnswers(articles))))
+    return JSON.stringify(await attachReaskQueue(await attachSourceDates(await attachAnswers(await attachQuestionRetries(db,articles)))))
+}
+const snapshotIdentity = process.env.LOCAL_REVIEW === '1'
+  ? await db.collection('_local_meta').findOne({_id:'snapshot'}) : null
+const cacheFile = process.env.LOCAL_REVIEW === '1' ? path.join(tmpdir(),
+  `news-review-${createHash('sha256').update(`${MONGODB_URI}:${db.databaseName}:${snapshotIdentity?.created_at?.toISOString()}`).digest('hex').slice(0,20)}.json`) : null
+const reviewHistory = process.env.LOCAL_REVIEW === '1'
+  ? createReviewCache(loadArticleHistory, cacheFile)
+  : createLiveHistory(loadArticleHistory)
+// Invalidate before and after writes so concurrent reads cannot retain old data.
+// Citation classifications are loaded separately and don't change answer history.
+app.use('/api', (req, res, next) => {
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)
+    && !(req.method === 'PATCH' && /^\/answers\/[^/]+$/.test(req.path) && !('citations' in (req.body??{})))) {
+    // Ingestion is append-only: keep the last history visible while rebuilding.
+    // Screenshots alone do not change the article history.
+    if(req.method === 'POST' && req.path === '/screenshots')return next()
+    const automatedDates = req.path === '/sources' &&
+      (Array.isArray(req.body) ? req.body : [req.body]).every(item => item?.method === 'pagedatefinder')
+    const invalidate = req.method === 'POST' && (req.path === '/articles' || automatedDates) && reviewHistory.invalidate
+      ? () => reviewHistory.invalidate() : () => reviewHistory.clear()
+    invalidate()
+    res.on('finish', () => {
+      invalidate()
+    })
+  }
+  next()
+})
+registerQuestionRetries(app,db)
+
+// Narrow authoritative intake projection: workers do not need full answer history.
+app.get('/api/collection-targets',async(req,res)=>{
+  try {
+    const articles=await db.collection('articles').find({}, {projection:{url:1,published_at:1,exclusive:1,questions:1,deleted_at:1}}).toArray()
+    res.json(articles)
+  } catch(err) { console.error(err);res.status(500).json({error:'Could not load collection targets'}) }
+})
+
+registerArticleReads(app,db,{attachAnswers,attachSourceDates,attachReaskQueue,attachQuestionRetries})
+
+app.get('/api/articles', async (req, res) => {
+  try {
+    const body = await reviewHistory.get({fresh:req.query.fresh === '1'})
+    const historyStatus = reviewHistory.status?.()
+    if(historyStatus?.updatedAt)res.set('X-History-Updated-At',new Date(historyStatus.updatedAt).toISOString())
+    res.set('X-History-Refreshing',String(historyStatus?.refreshing??false))
+    res.set('Cache-Control','no-store')
+    res.vary('Accept-Encoding')
+    res.type('json')
+    if (req.acceptsEncodings('gzip')) {
+      res.set('Content-Encoding', 'gzip')
+      return res.send(await gzipHistory(body))
+    }
+    res.send(body)
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Failed to fetch articles' })
@@ -307,164 +371,8 @@ app.get('/api/articles', async (req, res) => {
 // Same payload every time: url + ground truth + platform_answers, indexed the
 // way your scraper already emits them. A URL we've seen before records another
 // run against the existing question_ids instead of creating a duplicate.
-function questionKey(text) {
-  return (text ?? '').trim().toLowerCase().replace(/\s+/g, ' ')
-}
 
-app.post('/api/articles', async (req, res) => {
-  try {
-    const { url, published_at, updated_at, snippet, markdown, exclusive, questions, platform_answers } =
-      req.body
-
-    if (!url) {
-      return res.status(400).json({ error: 'url is required' })
-    }
-
-    const built = buildQuestions(questions ?? [], platform_answers ?? [])
-    const urlKey = canonicalUrl(url)
-    const articles = db.collection('articles')
-
-    let article = await articles.findOne({ url_key: urlKey })
-    const created = !article
-
-    if (created) {
-      article = {
-        url,
-        url_key: urlKey,
-        published_at: published_at ? new Date(published_at) : null,
-        // The story's own "Updated on…" stamp, separate from created_at, which
-        // is when this row was written. Breaking news gets rewritten in place,
-        // so the two dates answer different questions.
-        updated_at: updated_at ? new Date(updated_at) : null,
-        snippet: typeof snippet === 'string' && snippet.trim() ? snippet.trim() : null,
-        // The article's full text as it read when this run was collected. News
-        // pages get rewritten under their own URLs, so the snapshot is the only
-        // record of what the platforms could actually have been reading.
-        markdown: typeof markdown === 'string' && markdown.trim() ? markdown.trim() : null,
-        markdown_at: typeof markdown === 'string' && markdown.trim() ? new Date() : null,
-        // An outlet either has a story alone or it doesn't — unlike the
-        // free-text fields above, there's no "unknown yet" to preserve, so
-        // this is the one field here safe to set outright on creation
-        // rather than only filling in when missing.
-        exclusive: typeof exclusive === 'boolean' ? exclusive : false,
-        exclusive_at: exclusive ? new Date() : null,
-        questions: built.map((q) => ({
-          question_id: new ObjectId(),
-          question_index: q.question_index,
-          question: q.question,
-          answer: q.answer || null
-        })),
-        created_at: new Date()
-      }
-      const inserted = await articles.insertOne(article)
-      article._id = inserted.insertedId
-    }
-
-    // Match this payload's questions onto the article's existing ones. Text
-    // first, because question_index shifts if questions are ever reordered.
-    const byText = new Map(article.questions.map((q) => [questionKey(q.question), q]))
-    const byIndex = new Map(article.questions.map((q) => [q.question_index, q]))
-    const appended = []
-
-    const resolved = built.map((q) => {
-      let match = byText.get(questionKey(q.question)) ?? byIndex.get(q.question_index)
-
-      if (!match) {
-        match = {
-          question_id: new ObjectId(),
-          question_index: article.questions.length + appended.length,
-          question: q.question,
-          answer: q.answer || null
-        }
-        appended.push(match)
-      }
-      return { built: q, question: match }
-    })
-
-    const $set = {}
-    if (!created) {
-      // Fill in details the first submission may have lacked, never overwrite.
-      if (published_at && !article.published_at) $set.published_at = new Date(published_at)
-      if (snippet?.trim() && !article.snippet) $set.snippet = snippet.trim()
-      if (markdown?.trim() && !article.markdown) {
-        $set.markdown = markdown.trim()
-        $set.markdown_at = new Date()
-      }
-
-      // The exception to never-overwrite: a revision stamp is *expected* to
-      // move. A later run reporting a newer edit is news, not a correction.
-      if (updated_at) {
-        const revised = new Date(updated_at)
-        if (!Number.isNaN(revised.getTime())) {
-          if (!article.updated_at || revised > new Date(article.updated_at)) {
-            $set.updated_at = revised
-          }
-        }
-      }
-    }
-
-    if (appended.length || Object.keys($set).length) {
-      await articles.updateOne(
-        { _id: article._id },
-        {
-          ...(Object.keys($set).length ? { $set } : {}),
-          ...(appended.length ? { $push: { questions: { $each: appended } } } : {})
-        }
-      )
-    }
-
-    const runId = new ObjectId()
-    const runAt = req.body.run_at ? new Date(req.body.run_at) : new Date()
-    if (Number.isNaN(runAt.getTime())) {
-      return res.status(400).json({ error: 'run_at is not a valid date' })
-    }
-    const answerDocs = []
-
-    for (const { built: q, question } of resolved) {
-      for (const [platform, answer] of Object.entries(q.platforms ?? {})) {
-        // Same rule the run path uses: a slot left untouched in the pasted
-        // template — no text, no citations, no session link — is a platform
-        // that was never asked. Recording it fabricates an empty response.
-        if (emptyPlatformAnswer(answer)) continue
-        answerDocs.push({
-          article_id: article._id,
-          question_id: question.question_id,
-          platform,
-          run_id: runId,
-          run_at: runAt,
-          asked_at: answer.asked_at ?? null,
-          answer: answer.answer ?? '',
-          url: answer.url ?? null,
-          citations: answer.citations ?? [],
-          screenshot_id: answer.screenshot_id ?? null,
-          verdict: null,
-          graded_at: null,
-          note: null
-        })
-      }
-    }
-
-    if (answerDocs.length) await db.collection('answers').insertMany(answerDocs)
-
-    const runNumber = await db
-      .collection('answers')
-      .distinct('run_id', { article_id: article._id })
-
-    res.status(created ? 201 : 200).json({
-      ok: true,
-      article_id: article._id,
-      created,
-      run_id: runId,
-      run_number: runNumber.length,
-      questions_matched: resolved.length - appended.length,
-      questions_added: appended.length,
-      answers_recorded: answerDocs.length
-    })
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ error: 'Failed to save article' })
-  }
-})
+registerArticleIngestion(app,{db,canonicalUrl,emptyPlatformAnswer})
 
 function emptyPlatformAnswer(answer) {
   if (!answer) return true
@@ -501,11 +409,9 @@ function resolveRun({ article, platform_answers, runAt, positional = null }) {
   const groundTruth = order.map((q) => ({ question: q.question, answer: q.answer }))
 
   const built = buildQuestions(groundTruth, platform_answers)
-  const byText = new Map(active.map((q) => [questionKey(q.question), q]))
   // Positional fallback counts through `order`, the trimmed list the caller
   // pasted against. Keying on the stored question_index would point at whatever
   // sits at that index in the full list — quite possibly a flagged one.
-  const byPosition = new Map(order.map((q, i) => [i, q]))
 
   const skipped = []
   const answerDocs = []
@@ -524,7 +430,7 @@ function resolveRun({ article, platform_answers, runAt, positional = null }) {
       continue
     }
 
-    const match = byText.get(key) ?? byPosition.get(q.question_index)
+    const match = resolveQuestion(active,q.question,q.question_index,{allowPosition:true})
     if (!match) {
       skipped.push(q.question || `(question_index ${q.question_index})`)
       continue
@@ -541,6 +447,10 @@ function resolveRun({ article, platform_answers, runAt, positional = null }) {
         run_at: runAt,
         asked_at: answer.asked_at ?? null,
         answer: answer.answer ?? '',
+        question_variant: answer.question_variant ?? 'original',
+        asked_question: answer.asked_question ?? null,
+        model: answer.model ?? null,
+        search: answer.search ?? null,
         url: answer.url ?? null,
         citations: answer.citations ?? [],
         screenshot_id: answer.screenshot_id ?? null,
@@ -584,7 +494,7 @@ app.post('/api/articles/:id/questions', async (req, res) => {
     }
 
     const articles = db.collection('articles')
-    const article = await articles.findOne({ _id: new ObjectId(id) })
+    const article = await articles.findOne({ _id: new ObjectId(id), deleted_at: {$exists:false} })
     if (!article) {
       return res.status(404).json({ error: 'Article not found' })
     }
@@ -639,10 +549,11 @@ app.post('/api/articles/:id/questions', async (req, res) => {
       return res.status(400).json({ error: 'No new questions to add', skipped })
     }
 
-    await articles.updateOne(
-      { _id: article._id },
+    const updated = await articles.updateOne(
+      { _id: article._id, questions: existing, deleted_at: {$exists:false} },
       { $push: { questions: { $each: added } } }
     )
+    if(!updated.matchedCount)return res.status(409).json({error:'Questions changed; reload and retry'})
 
     if (platform_answers.length === 0) {
       return res.json({ ok: true, added: added.length, skipped })
@@ -674,7 +585,7 @@ app.post('/api/articles/:id/questions', async (req, res) => {
     })
   } catch (err) {
     console.error(err)
-    res.status(500).json({ error: 'Failed to add questions' })
+    res.status(err.status??500).json({ error: err.status===400?err.message:'Failed to add questions' })
   }
 })
 
@@ -695,7 +606,7 @@ app.post('/api/articles/:id/runs', async (req, res) => {
     }
 
     const articles = db.collection('articles')
-    const article = await articles.findOne({ _id: new ObjectId(id) })
+    const article = await articles.findOne({ _id: new ObjectId(id), deleted_at: {$exists:false} })
     if (!article) {
       return res.status(404).json({ error: 'Article not found' })
     }
@@ -804,7 +715,7 @@ app.patch('/api/articles/:id', async (req, res) => {
 
     const result = await db
       .collection('articles')
-      .updateOne({ _id: new ObjectId(id) }, { $set })
+      .updateOne({ _id: new ObjectId(id), deleted_at: {$exists:false} }, { $set })
 
     if (result.matchedCount === 0) {
       return res.status(404).json({ error: 'Article not found' })
@@ -825,18 +736,13 @@ app.delete('/api/articles/:id', async (req, res) => {
       return res.status(400).json({ error: 'Not a valid article id' })
     }
 
-    const result = await db
-      .collection('articles')
-      .deleteOne({ _id: new ObjectId(id) })
-
-    if (result.deletedCount === 0) {
-      return res.status(404).json({ error: 'Article not found' })
-    }
-
-    // Answers live in their own collection now, so they don't go with the
-    // article automatically. Leaving them behind orphans every run.
-    await db.collection('answers').deleteMany({ article_id: new ObjectId(id) })
-    await db.collection('reask_queue').deleteMany({ article_id: new ObjectId(id) })
+    // Retain a durable tombstone in the canonical URL's unique row. An old
+    // delivery can never recreate it, including after a process crash.
+    const result = await db.collection('articles').updateOne(
+      {_id:new ObjectId(id),deleted_at:{$exists:false}}, {$set:{deleted_at:new Date()}})
+    if(!result.matchedCount)return res.status(404).json({error:'Article not found'})
+    await db.collection('reask_queue').deleteMany({article_id:new ObjectId(id)})
+    await db.collection('question_retry_queue').deleteMany({article_id:new ObjectId(id)})
 
     res.status(204).end()
   } catch (err) {
@@ -845,9 +751,8 @@ app.delete('/api/articles/:id', async (req, res) => {
   }
 })
 
-// Manual re-ask queue. The pipeline no longer re-asks a story's questions on
-// its own schedule -- it alerts (Slack) when a 30m/1h/5h/1d mark comes due,
-// and a re-ask only happens when someone asks for one here. Each entry is one
+// Manual article re-ask queue, separate from automatic milestone collection
+// and question-scoped browser retries. Each entry is one
 // article waiting to have its unflagged questions put to the four platforms
 // again; the pipeline's answer worker polls GET /api/reask-queue, works
 // through it oldest first, and DELETEs each entry once the fresh answers are
@@ -863,7 +768,7 @@ app.post('/api/articles/:id/reask', async (req, res) => {
 
     const article = await db
       .collection('articles')
-      .findOne({ _id: new ObjectId(id) }, { projection: { questions: 1 } })
+      .findOne({ _id: new ObjectId(id), deleted_at: {$exists:false} }, { projection: { questions: 1 } })
     if (!article) {
       return res.status(404).json({ error: 'Article not found' })
     }
@@ -940,13 +845,13 @@ app.get('/api/reask-queue', async (req, res) => {
       .aggregate([
         { $sort: { requested_at: 1 } },
         { $lookup: { from: 'articles', localField: 'article_id', foreignField: '_id', as: 'article' } },
-        { $project: { requested_at: 1, article_id: 1, 'article.url': 1, 'article.published_at': 1, 'article.exclusive': 1, 'article.questions': 1 } }
+        { $project: { requested_at: 1, article_id: 1, 'article.url': 1, 'article.published_at': 1, 'article.exclusive': 1, 'article.questions': 1, 'article.deleted_at':1 } }
       ])
       .toArray()
 
     res.json({
       items: entries.map((entry) => {
-        const article = entry.article[0]
+        const article = entry.article[0]?.deleted_at ? null : entry.article[0]
         return {
           article_id: entry.article_id,
           requested_at: entry.requested_at,
@@ -959,7 +864,7 @@ app.get('/api/reask-queue', async (req, res) => {
           questions: (article?.questions ?? [])
             .filter((q) => !q.flagged)
             .sort((a, b) => (a.question_index ?? 0) - (b.question_index ?? 0))
-            .map((q) => ({ question_index: q.question_index, question: q.question, answer: q.answer }))
+            .map((q) => ({ question_id:q.question_id, question_index: q.question_index, question: q.question, answer: q.answer }))
         }
       })
     })
@@ -969,7 +874,6 @@ app.get('/api/reask-queue', async (req, res) => {
   }
 })
 
-const VERDICTS = ['correct', 'partial', 'incorrect', 'abstained', 'speculation']
 const JUDGMENTS = ['yes', 'no', 'unsure']
 
 // Shared guard: every nested update targets one question inside one article.
@@ -1098,72 +1002,24 @@ app.patch('/api/articles/:id/questions/:index', async (req, res) => {
 // that URL is cited. POST /api/sources  [{ url, published_at, precision }]
 // `precision` is 'date' when the source printed a day but no clock time, so the
 // UI knows not to show the placeholder hour it was stored with.
-app.post('/api/sources', async (req, res) => {
-  try {
-    const items = Array.isArray(req.body) ? req.body : [req.body]
+registerSourceDates(app,{db,canonicalUrl})
 
-    const bad = items.find(
-      (s) => s?.precision != null && !['date', 'datetime'].includes(s.precision)
-    )
-    if (bad) {
-      return res.status(400).json({ error: "precision must be 'date' or 'datetime'" })
-    }
-
-    const invalid = items.find((s) =>
-      (s?.method != null && !['manual', 'pagedatefinder'].includes(s.method)) ||
-      (s?.published_at && Number.isNaN(new Date(s.published_at).getTime()))
-    )
-    if (invalid) return res.status(400).json({ error: 'Invalid source method or publication date' })
-
-    const ops = items
-      .filter((s) => s?.url)
-      .map((s) => ({
-        updateOne: {
-          filter: { url: canonicalUrl(s.url), method: s.method ?? 'manual' },
-          update: {
-            $set: {
-              url: canonicalUrl(s.url),
-              published_at: s.published_at ? new Date(s.published_at) : null,
-              // No date, no precision to describe — clearing one leaves the
-              // record saying "we looked and don't know", not "midnight".
-              precision: s.published_at ? s.precision ?? 'datetime' : null,
-              status: 'ok',
-              method: s.method ?? 'manual',
-              resolved_at: new Date()
-            }
-          },
-          upsert: true
-        }
-      }))
-
-    if (ops.length === 0) {
-      return res.status(400).json({ error: 'No sources with a url provided' })
-    }
-
-    const result = await db.collection('sources').bulkWrite(ops)
-    res.json({
-      ok: true,
-      inserted: result.upsertedCount,
-      updated: result.modifiedCount
-    })
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ error: 'Failed to save sources' })
-  }
-})
-
-// Full dump of the collections as stored in MongoDB — articles, answers, and
-// sources — so nothing collected is flattened away.
+// Active study dataset. Bad questions and their responses are excluded;
+// stored records remain available for recovery.
 // GET /api/export.json
 app.get('/api/export.json', async (req, res) => {
   try {
-    const [articles, answers, sources] = await Promise.all([
-      db.collection('articles').find().toArray(),
+    const [articles, answers, sources, citationTypes, citationDomains, citationCategories, citationDomainPlatforms] = await Promise.all([
+      db.collection('articles').find({deleted_at:{$exists:false}}).toArray(),
       db.collection('answers').find().toArray(),
-      db.collection('sources').find().toArray()
+      db.collection('sources').find().toArray(),
+      db.collection('citation_types').find().toArray(),
+      db.collection('citation_domains').find().toArray(),
+      db.collection('citation_categories').find().toArray(),
+      db.collection('citation_domain_platforms').find().toArray()
     ])
 
-    const payload = { articles, answers, sources }
+    const payload = { ...activeDataset(articles, answers), sources, citation_types: citationTypes, citation_domains: citationDomains, citation_categories: citationCategories, citation_domain_platforms: citationDomainPlatforms }
     const stamp = new Date().toISOString().slice(0, 10)
 
     res.setHeader('Content-Type', 'application/json; charset=utf-8')
@@ -1182,100 +1038,20 @@ app.get('/api/export.csv', (req, res) => {
   res.redirect(301, '/api/export.json')
 })
 
+// The verdict taxonomy manual grading uses -- editable from the app's
+// Settings tab rather than hardcoded, so validVerdicts() is read fresh on
+// every grade.
+// GET/POST /api/verdict-categories, DELETE /api/verdict-categories/:value
+const {validVerdicts} = await registerVerdictCategories(app,{db})
+
+// Read-only archive of past {articles, answers, sources} exports -- separate
+// from the live collections, see archive.js's module comment.
+// GET/POST /api/archive, DELETE /api/archive/:id
+registerArchive(app,{db})
+
 // Grade one answer — that is, one platform's response in one specific run.
-// PATCH /api/answers/:id  { verdict, note, answer, citations }
-app.patch('/api/answers/:id', async (req, res) => {
-  try {
-    const { id } = req.params
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ error: 'Not a valid answer id' })
-    }
-
-    const body = req.body ?? {}
-    const { verdict, note, answer } = body
-    if (verdict !== null && verdict !== undefined && !VERDICTS.includes(verdict)) {
-      return res
-        .status(400)
-        .json({ error: `verdict must be null or one of: ${VERDICTS.join(', ')}` })
-    }
-
-    const $set = {}
-    if ('verdict' in body) {
-      $set.verdict = verdict ?? null
-      $set.graded_at = verdict ? new Date() : null
-    }
-    if ('note' in body) {
-      const text = typeof note === 'string' ? note.trim() : ''
-      $set.note = text || null
-    }
-
-    if ('answer' in body && typeof answer !== 'string') {
-      return res.status(400).json({ error: 'answer must be a string' })
-    }
-    if ('citations' in body && !Array.isArray(body.citations)) {
-      return res.status(400).json({ error: 'citations must be an array' })
-    }
-
-    let existing = null
-    if ('answer' in body || 'citations' in body) {
-      existing = await db
-        .collection('answers')
-        .findOne({ _id: new ObjectId(id) }, { projection: { answer: 1, answer_original: 1, citations: 1 } })
-
-      if (!existing) {
-        return res.status(404).json({ error: 'Answer not found' })
-      }
-    }
-
-    // A scrape that mangled the response — truncated it, dropped a paragraph,
-    // swallowed the markup — can be corrected by hand. What the platform
-    // actually returned is the evidence this whole study rests on, though, so
-    // the first correction stashes the scraped text under `answer_original`
-    // and later ones leave that untouched. Both fields go out in the export.
-    if ('answer' in body) {
-      $set.answer = answer.trim()
-      $set.answer_edited_at = new Date()
-      if (existing.answer_original === undefined) {
-        $set.answer_original = existing.answer ?? ''
-      }
-    }
-
-    // Filling in citations the scrape missed (parsed from a pasted answer).
-    // Only ever into an empty list: a scraped set is the evidence the study
-    // rests on, so it isn't replaced by anything typed in later.
-    if ('citations' in body) {
-      if ((existing.citations ?? []).length > 0) {
-        return res.status(409).json({ error: 'This answer already has citations — they are not overwritten' })
-      }
-      $set.citations = cleanManualCitations(body.citations)
-    }
-
-    if (Object.keys($set).length === 0) {
-      return res.status(400).json({ error: 'No recognised fields to update' })
-    }
-
-    const result = await db.collection('answers').updateOne(
-      { _id: new ObjectId(id) },
-      { $set }
-    )
-
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ error: 'Answer not found' })
-    }
-
-    res.json({
-      ok: true,
-      verdict,
-      answer: $set.answer,
-      answer_original: $set.answer_original,
-      answer_edited_at: $set.answer_edited_at,
-      citations: $set.citations
-    })
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ error: 'Failed to save answer' })
-  }
-})
+// PATCH /api/answers/:id  { verdict, confidence, note, answer, citations }
+registerAnswerReview(app,{db,validVerdicts,reviewHistory})
 
 // Screenshots (Google AI Overview evidence -- see answers.py) live in
 // GridFS, uploaded once by the pipeline right after capture and referenced
@@ -1291,6 +1067,7 @@ app.post('/api/screenshots', async (req, res) => {
     }
 
     const buffer = Buffer.from(data, 'base64')
+    if(!buffer.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) return res.status(400).json({error:'Only PNG screenshots are supported'})
     if (buffer.length === 0) {
       return res.status(400).json({ error: 'data decoded to an empty file' })
     }
@@ -1399,7 +1176,7 @@ app.post('/api/articles/:id/questions/:index/answers', async (req, res) => {
       run_at: runDoc.run_at,
       asked_at: null,
       answer: text,
-      url: typeof url === 'string' && url.trim() ? url.trim() : null,
+      url: safeHttpUrl(url),
       citations: cleanManualCitations(citations),
       verdict: null,
       graded_at: null,
@@ -1408,8 +1185,9 @@ app.post('/api/articles/:id/questions/:index/answers', async (req, res) => {
       added_at: new Date()
     }
 
-    const inserted = await db.collection('answers').insertOne(doc)
-    res.status(201).json({ ...doc, _id: inserted.insertedId })
+    const prepared = doc
+    const inserted = await db.collection('answers').insertOne(prepared)
+    res.status(201).json({ ...prepared, _id: inserted.insertedId })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Failed to add answer' })
@@ -1433,7 +1211,8 @@ app.use((req, res) => {
 })
 
 const port = process.env.PORT || 3000
-const server = app.listen(port, () => {
+// Full legacy history is read on demand; paginated review does not need it.
+const server = app.listen(port, productionEnvironment(process.env) && process.env.LOCAL_REVIEW !== '1' ? '0.0.0.0' : '127.0.0.1', () => {
   console.log(`API listening on http://localhost:${port}`)
 })
 
@@ -1445,12 +1224,15 @@ async function shutdown(signal) {
   if (shuttingDown) return
   shuttingDown = true
   console.log(`${signal} received — closing server and database connection`)
-  server.close()
+  const deadline=setTimeout(()=>process.exit(1),15000)
+  deadline.unref()
+  await new Promise(resolve=>server.close(resolve))
   try {
     await client.close()
   } catch (err) {
     console.error('Error closing MongoDB connection:', err.message)
   }
+  clearTimeout(deadline)
   process.exit(0)
 }
 

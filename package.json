@@ -6,10 +6,11 @@
     "node": "22.x"
   },
   "scripts": {
-    "build": "npm install --prefix api && npm install --prefix web && npm run build --prefix web",
+    "build": "npm ci --prefix api && npm ci --prefix web && npm run build --prefix web",
     "start": "node api/server.js",
     "dev:api": "npm run dev --prefix api",
     "dev:web": "npm run dev --prefix web",
-    "import:csv": "python3 tools/import_manual_csv.py"
+    "import:csv": "python3 tools/import_manual_csv.py",
+    "test": "node --test *.test.mjs"
   }
 }

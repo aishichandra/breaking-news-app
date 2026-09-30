@@ -1,19 +1,23 @@
 <script>
+  import {safeHttpUrl} from '../../../safe-url.mjs'
+  import { sourceCitationStatus } from '../../../source-match.mjs'
   import { untrack } from 'svelte'
   import { API } from './api.js'
   import CitationRow from './CitationRow.svelte'
   import { highlightSegments } from './highlight.js'
   import { parsePastedAnswer } from './parseCitations.js'
   import { describeLag, domainOf, formatDateTime } from './time.js'
-  import { PLATFORM_LABELS as LABELS, GROUP_OF, VERDICTS } from './verdicts.js'
+  import { answerLabel, GROUP_OF, VERDICTS } from './verdicts.js'
 
   let {
     name,
     displayName = null,
     comparison = false,
+    compact = false,
     result,
     publishedAt = null,
     articleId,
+    sourceUrl = null,
     questionIndex,
     runId = null,
     onGraded = () => {},
@@ -43,6 +47,8 @@
   const citations = $derived(
     effectiveResult?.citations?.length ? effectiveResult.citations : (addedCitations ?? [])
   )
+  const originalSourceCited = $derived(sourceCitationStatus(sourceUrl, citations))
+
   // Google only -- a screenshot of the AI Overview page at the moment it was
   // captured (or the failure happened), evidence for verifying the
   // extraction or diagnosing a miss without reproducing the search live.
@@ -63,6 +69,13 @@
 
   let expanded = $state(false)
   let verdict = $state(untrack(() => effectiveResult?.verdict ?? null))
+  // Drives the card's light background tint -- each category owns one color,
+  // used at full strength for the pressed grade button and mixed with white
+  // for the card, so a category added from Settings needs no CSS of its own.
+  const verdictColor = $derived(verdict ? VERDICTS().find((v) => v.value === verdict)?.color : null)
+  let confidence = $state(untrack(() => effectiveResult?.confidence ?? null))
+  let savingGrade = $state(false)
+  const canRateConfidence = $derived(verdict === 'correct' || verdict === 'incorrect')
   let note = $state(untrack(() => effectiveResult?.note ?? ''))
   let savedNote = $state(untrack(() => effectiveResult?.note ?? ''))
   let savingNote = $state(false)
@@ -135,17 +148,39 @@
   }
 
   async function setVerdict(next) {
+    if (savingGrade) return
     const previous = verdict
+    const previousConfidence = confidence
     verdict = verdict === next ? null : next
+    if (verdict !== 'correct' && verdict !== 'incorrect') confidence = null
     saveError = null
-
+    savingGrade = true
     try {
       await patchAnswer({ verdict })
       onGraded(name, verdict)
     } catch (err) {
       verdict = previous
+      confidence = previousConfidence
       saveError = err.message
-      onGraded(name, previous)
+    } finally {
+      savingGrade = false
+    }
+  }
+
+  async function setConfidence(next) {
+    if (savingGrade || !canRateConfidence) return
+    const previous = confidence
+    confidence = confidence === next ? null : next
+    savingGrade = true
+    saveError = null
+    try {
+      await patchAnswer({ confidence })
+      onGraded(name, verdict)
+    } catch (err) {
+      confidence = previous
+      saveError = err.message
+    } finally {
+      savingGrade = false
     }
   }
 
@@ -316,9 +351,10 @@
   {/if}
 {/snippet}
 
-<div class="platform" class:comparison data-verdict={verdict} data-group={group}>
+<div class="platform" class:compact class:comparison class:graded={!!verdictColor}
+  style={verdictColor ? `--verdict-tint: ${verdictColor}` : ''} data-group={group}>
   <div class="head">
-    <span class="name">{displayName ?? LABELS[name] ?? name}</span>
+    <span class="name">{displayName ?? answerLabel(name,effectiveResult)}</span>
     <span class="group-badge {group}" title={group === 'api' ? 'Called the model/search API directly' : 'Asked by driving the real consumer product in a browser'}>{group === 'api' ? 'API' : 'LIVE'}</span>
     {#if manuallyAdded}
       <span
@@ -332,7 +368,7 @@
       >edited</span>
     {/if}
     {#if effectiveResult?.url}
-      <a class="session" href={effectiveResult.url} target="_blank" rel="noreferrer">↗</a>
+      <a class="session" href={safeHttpUrl(effectiveResult.url)??undefined} target="_blank" rel="noreferrer">↗</a>
     {/if}
   </div>
 
@@ -398,7 +434,18 @@
       </a>
     {/if}
 
+    {#if effectiveResult?.asked_question}
+      <details class="prompt"><summary>Question asked</summary>{effectiveResult.asked_question}</details>
+    {/if}
+    <details class="citation-details" open>
+      <summary>{citations.length} citations · {originalSourceCited ? '✓ Original source cited' : 'Original source not found in captured citations'}</summary>
     <div class="cites">
+      {#if originalSourceCited !== null}
+        <p class="source-match" class:matched={originalSourceCited}
+          title="Matches the original article URL, ignoring tracking parameters, fragments, www, HTTP/HTTPS and trailing slashes. Redirects are not resolved.">
+          {originalSourceCited ? '✓ Original source cited' : 'Original source not found in captured citations'}
+        </p>
+      {/if}
       {#if citations.length > 0}
         <div class="table-wrap">
           <table>
@@ -420,14 +467,17 @@
         <span class="none">No citations</span>
       {/if}
     </div>
+    </details>
     <div class="grade">
-      {#each VERDICTS as v}
+      {#each VERDICTS() as v}
         <button
-          class="verdict {v.value}"
+          class="verdict"
           class:on={verdict === v.value}
+          style="--verdict-color: {v.color}"
           data-tip={v.title}
           aria-label={v.title}
           aria-pressed={verdict === v.value}
+          disabled={savingGrade}
           onclick={() => setVerdict(v.value)}
         >{v.symbol}</button>
       {/each}
@@ -436,6 +486,17 @@
         <span class="verdict-name">{verdict}</span>
       {/if}
     </div>
+
+    {#if canRateConfidence}
+      <div class="confidence" role="group" aria-label="Response confidence">
+        <span>Response confidence</span>
+        {#each [{ value: 'confident', label: 'Confident' }, { value: 'not_confident', label: 'Not confident' }] as option}
+          <button type="button" class:chosen={confidence === option.value}
+            aria-pressed={confidence === option.value} disabled={savingGrade}
+            onclick={() => setConfidence(option.value)}>{option.label}</button>
+        {/each}
+      </div>
+    {/if}
 
     {#if commenting}
       <div class="comment">
@@ -487,6 +548,11 @@
 </div>
 
 <style>
+  .compact {padding:24px;background:var(--card);border:1px solid var(--line);border-radius:9px;}
+  .compact .answer {font-family:Georgia,serif;font-size:14px;line-height:1.6;}
+  .citation-details {margin-top:18px;}
+  .citation-details>summary {cursor:pointer;font-size:12px;color:var(--muted);}
+
   .platform {
     display: flex;
     flex-direction: column;
@@ -495,11 +561,7 @@
     border: 1px solid var(--line);
   }
 
-  .platform[data-verdict='correct']     { background: #edf7ef; }
-  .platform[data-verdict='incorrect']   { background: #fceeee; }
-  .platform[data-verdict='partial']     { background: #fff8df; }
-  .platform[data-verdict='abstained']   { background: #f1f1f3; }
-  .platform[data-verdict='speculation'] { background: #f3edfa; }
+  .platform.graded { background: color-mix(in srgb, var(--verdict-tint) 10%, white); }
 
   .head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; }
 
@@ -582,6 +644,11 @@
 
 
   .grade { display: flex; align-items: center; gap: 0.2rem; margin-top: 0.75rem; padding-top: 0.7rem; border-top: 1px solid var(--line); }
+  .confidence { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; font-size: 0.72rem; }
+  .confidence > span { width: 100%; color: var(--muted); }
+  .confidence button { font: inherit; padding: 0.3rem 0.55rem; border: 1px solid var(--line); background: var(--card); color: var(--text); cursor: pointer; }
+  .confidence button.chosen { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .confidence button:disabled { opacity: 0.6; cursor: wait; }
   .verdict-name { margin-left: 0.35rem; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
 
   /* Both links share the row the Show more button used to have to itself. */
@@ -688,11 +755,7 @@
   }
 
   .verdict:hover { color: var(--text); border-color: var(--muted); }
-  .verdict.correct.on     { background: #1a7f45; border-color: transparent; color: #fff; }
-  .verdict.partial.on     { background: #b8860b; border-color: transparent; color: #fff; }
-  .verdict.incorrect.on   { background: #b00020; border-color: transparent; color: #fff; }
-  .verdict.abstained.on   { background: #55555f; border-color: transparent; color: #fff; }
-  .verdict.speculation.on { background: #6b4fa8; border-color: transparent; color: #fff; }
+  .verdict.on { background: var(--verdict-color); border-color: transparent; color: #fff; }
 
   .lag {
     color: var(--muted);
@@ -719,6 +782,9 @@
   }
   .link:hover { color: var(--text); text-decoration: underline; }
 
+  .prompt { font-size: 0.72rem; overflow-wrap: anywhere; }
+  .source-match { font-size: 0.72rem; color: var(--muted); }
+  .source-match.matched { color: #0a6b3d; font-weight: 650; }
   .cites { margin-top: auto; padding-top: 0.6rem; }
   .cites:empty { padding-top: 0; }
   .table-wrap { overflow-x: auto; }

@@ -1,22 +1,17 @@
 <script>
   import { untrack } from 'svelte'
   import { API } from './api.js'
-  import QuestionTimeline from './QuestionTimeline.svelte'
+  import QuestionWorkspace from './QuestionWorkspace.svelte'
   import { extractKeyTerms } from './highlight.js'
-  import { PLATFORM_NAMES, PLATFORM_GROUPS, PLATFORM_LABELS, SYMBOL } from './verdicts.js'
+  import QuestionSummary from './QuestionSummary.svelte'
 
-  // The collapsed summary stays a quick glance regardless of whether the API
-  // columns are toggled on elsewhere — it's the live-interface platforms
-  // that answer "how did the real products do", so that's what a compact
-  // row of chips should show. The full breakdown is one click away.
-  const SUMMARY_PLATFORMS = PLATFORM_GROUPS.find((g) => g.id === 'interface').names
-  import { formatApproxDuration, toDate } from './time.js'
 
   let {
     q,
     index,
     publishedAt,
     articleId,
+    sourceUrl = null,
     onCitationSaved = () => {},
     // Flagging is the one edit here the card above cares about: it decides
     // which questions the update form offers to re-ask.
@@ -25,60 +20,43 @@
 
   const questionIndex = $derived(q.question_index ?? index)
 
-  function snapshotRuns(runs) {
-    return Object.fromEntries(
-      (runs ?? []).map((run) => [
-        String(run.run_id),
-        Object.fromEntries(
-          PLATFORM_NAMES.map((n) => [n, run.platforms?.[n]?.verdict ?? null])
-        )
-      ])
-    )
-  }
-
   // Local working copies, written through to the server on change.
   let questionText = $state(untrack(() => q.question))
   let groundTruth = $state(untrack(() => q.answer ?? ''))
   const terms = $derived(extractKeyTerms(groundTruth))
   let flagged = $state(untrack(() => q.flagged ?? false))
-  let runVerdicts = $state(untrack(() => snapshotRuns(q.runs)))
-  const latestRunId = $derived(String(q.runs?.at(-1)?.run_id ?? ''))
-
-  const progression = $derived(
-    (q.runs ?? []).map((run, i) => {
-      const id = String(run.run_id)
-      const marks = runVerdicts[id] ?? {}
-      const names = SUMMARY_PLATFORMS.filter((n) => run.platforms?.[n]?.answer)
-      const pub = toDate(publishedAt)
-      const asked = toDate(run.asked_at)
-      const lagMs = pub && asked ? asked - pub : null
-      return {
-        id,
-        lag: lagMs == null ? null : formatApproxDuration(lagMs),
-        lagNegative: lagMs != null && lagMs < 0,
-        names,
-        marks,
-        done: names.length > 0 && names.every((n) => marks[n])
-      }
-    })
-  )
+  let runVerdicts = $state({})
 
   function handleGraded(runId, platform, verdict) {
     runVerdicts = {
       ...runVerdicts,
       [runId]: { ...runVerdicts[runId], [platform]: verdict }
     }
-    const latest = runVerdicts[latestRunId] ?? {}
-    if (
-      String(runId) === latestRunId &&
-      PLATFORM_NAMES.filter((n) => q.platforms?.[n]?.answer).every((n) => latest[n])
-    ) {
-      collapsed = true
-    }
+    onFlagged()
+    // Keep the question open so confidence can be marked after the verdict.
+
   }
 
   // Every question starts folded; open the one you're working on.
   let collapsed = $state(true)
+  let detail = $state(null)
+  let loadingAnswers = $state(false)
+  let answersError = $state(null)
+  // A new summary object arrives after polling or a saved grade. Reload only
+  // while this question is open; closed cards never fetch response bodies.
+  $effect(() => {
+    const current=q
+    if(collapsed||current.answers_loaded!==false)return
+    let cancelled=false
+    loadingAnswers=true
+    answersError=null
+    fetch(`${API}/api/articles/${articleId}/questions/${current.question_id}/history`)
+      .then(async res=>{if(!res.ok)throw new Error(`Could not load answers (${res.status})`);return res.json()})
+      .then(value=>{if(!cancelled)detail=value})
+      .catch(err=>{if(!cancelled)answersError=err.message})
+      .finally(()=>{if(!cancelled)loadingAnswers=false})
+    return ()=>{cancelled=true}
+  })
   let fromSnippet = $state(untrack(() => q.answerable_from_snippet ?? null))
   let fromHistory = $state(untrack(() => q.answerable_from_history ?? null))
   let notes = $state(untrack(() => q.notes ?? ''))
@@ -86,6 +64,21 @@
 
   let savingNotes = $state(false)
   let error = $state(null)
+
+  let retrying = $state(false)
+  let retryNotice = $state('')
+  async function retryBrowser() {
+    retrying = true
+    error = null
+    try {
+      const res = await fetch(`${API}/api/articles/${articleId}/questions/${questionIndex}/retry`, {method:'POST'})
+      const body = await res.json()
+      if(!res.ok) throw new Error(body.error??'Could not queue retry')
+      retryNotice = 'Browser retry queued for this question.'
+      onFlagged()
+    } catch(err) { error = err.message }
+    finally { retrying = false }
+  }
 
   async function patch(body) {
     error = null
@@ -206,25 +199,8 @@
         <span class="chevron" aria-hidden="true">{collapsed ? '▸' : '▾'}</span>
         <span class="expander-body">
           <span class="qtext">{questionText}</span>
-          {#if collapsed && progression.length > 0}
-            <span class="progress">
-              {#each progression as step, i (step.id)}
-                {#if i > 0}<span class="sep" aria-hidden="true">→</span>{/if}
-                <span class="step" class:done={step.done}>
-                  {#if step.lag}
-                    <span class="when" class:warn={step.lagNegative}>{step.lag}</span>
-                  {/if}
-                  <span class="grades">
-                    {#each step.names as name}
-                      <span
-                        class="chip {step.marks[name] ?? 'ungraded'}"
-                        title="{PLATFORM_LABELS[name]}{step.marks[name] ? ` — ${step.marks[name]}` : ' — ungraded'}"
-                      >{step.marks[name] ? SYMBOL[step.marks[name]] : '·'}</span>
-                    {/each}
-                  </span>
-                </span>
-              {/each}
-            </span>
+          {#if collapsed}
+            <QuestionSummary runs={q.runs??[]} {publishedAt} verdicts={runVerdicts}/>
           {:else if !collapsed}
             {#if groundTruth}
               <span class="answer-line"><span class="arrow">→</span><span class="truth">{groundTruth}</span></span>
@@ -237,6 +213,10 @@
     </div>
 
     <div class="meta">
+      <button class="toggle" disabled={retrying||q.retry_queued} onclick={retryBrowser}
+        title="Retry this question on Google, ChatGPT, Claude and Perplexity in the browser">
+        {retrying?'Queuing…':q.retry_queued?'Browser retry queued':'Retry browser'}
+      </button>
       <button
         class="toggle"
         class:on={fromSnippet === 'yes'}
@@ -283,15 +263,20 @@
       </div>
     {/if}
 
-    <QuestionTimeline
-      runs={q.runs ?? []}
+    {#if answersError}<p class="err" role="alert">{answersError}</p>{/if}
+    {#if loadingAnswers && !detail}<p role="status">Loading answers…</p>{/if}
+    {#if q.answers_loaded!==false || detail}
+    <QuestionWorkspace
+      runs={(q.answers_loaded===false?detail?.runs:q.runs) ?? []}
       {publishedAt}
       {articleId}
+      {sourceUrl}
       {questionIndex}
       {terms}
       onGraded={handleGraded}
       {onCitationSaved}
     />
+    {/if}
 
     <div class="notes">
       <span class="label">Notes</span>
@@ -304,6 +289,7 @@
     </div>
   {/if}
 
+  {#if retryNotice && q.retry_queued}<p class="retry-notice" role="status">{retryNotice}</p>{/if}
   {#if error}<p class="err">{error}</p>{/if}
 </section>
 
@@ -366,38 +352,6 @@
   .truth { padding: 0.08rem 0.3rem; background: #ffe89a; font-weight: 600; }
   .no-answer { color: var(--muted); font-style: italic; }
 
-  .progress {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 0.35rem 0.45rem;
-    margin: 0.35rem 0 0;
-    padding: 0;
-    list-style: none;
-  }
-
-  .progress .step {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.3rem;
-  }
-
-  .progress .when {
-    font-size: 0.68rem;
-    font-weight: 650;
-    color: var(--muted);
-    font-variant-numeric: tabular-nums;
-  }
-
-  .progress .step.done .when { color: #0a6b3d; }
-  .progress .when.warn,
-  .progress .step.done .when.warn { color: var(--danger); }
-
-  .progress .sep {
-    color: var(--line);
-    font-size: 0.72rem;
-  }
-
   /* One quiet row for every secondary control, so nothing here competes with
      the question and its answer above. */
   .meta {
@@ -426,25 +380,6 @@
   .toggle.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 
 
-  .chip {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 1.05rem;
-    height: 1.05rem;
-    font-size: 0.68rem;
-    line-height: 1;
-    color: #fff;
-    background: var(--muted);
-  }
-
-  .chip.ungraded   { color: var(--muted); background: var(--line); }
-  .chip.correct     { background: #1a7f45; }
-  .chip.partial     { background: #b8860b; }
-  .chip.incorrect   { background: #b00020; }
-  .chip.abstained   { background: #55555f; }
-  .chip.speculation { background: #6b4fa8; }
-
   .link { padding: 0; font: inherit; font-size: 0.72rem; color: var(--muted); background: none; border: 0; cursor: pointer; }
   .link:hover { color: var(--text); text-decoration: underline; }
   .link.danger:hover { color: var(--danger); }
@@ -466,5 +401,7 @@
   .qa-edit-actions { display: flex; align-items: center; gap: 0.8rem; margin-top: 0.5rem; }
   .qa-edit-actions .primary { margin-top: 0; }
 
+  .retry-notice { font-size:0.75rem; color:var(--muted); }
+  .toggle:disabled { opacity:0.6; cursor:default; }
   .err { margin: 0.5rem 0 0; font-size: 0.78rem; color: var(--danger); }
 </style>
